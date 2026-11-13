@@ -961,6 +961,12 @@ with `scratch: true`; without it they work on the painting.
 - It keeps its own clock. Time spent or waited there (`wait`) doesn't
   pass for the painting, and the painting's time doesn't pass for it.
 - To use what worked, paint it on the painting: the same pile, the same handling.
+- `easel do --scratch --copy` (the command line's) puts the scratch canvas aside and starts
+  one that is a copy of the painting as it stands: its paint, wet or dry, and its clock, so a
+  passage is tried on the very underlayers it will go over, at their own stage of drying. Its
+  palette, brushes and variables are its own (run the chunk that sets them up there first),
+  and its log can't rebuild it: a copy the easel has to reopen comes back as a fresh canvas.
+  Copy again for each new trial; nothing done on it reaches the painting.
 - `new_scratch: true` (with `scratch: true`) puts the scratch canvas aside and starts a
   fresh one before the chunk runs. The old log stays, as `paintings/lua/scratch-1.lua`, and so on.
   The fresh canvas stays even if the chunk stops with an error: the old trial's marks,

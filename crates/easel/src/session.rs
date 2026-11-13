@@ -265,6 +265,14 @@ impl CanvasSnapshot {
     }
 }
 
+/// A session's canvas and clock, packed (`Session::canvas_copy`), for another session to take
+/// (`Session::adopt_copy`).
+pub struct CanvasCopy {
+    snap: CanvasSnapshot,
+    clock: f64,
+    clock0: f64,
+}
+
 /// Everything a failed chunk could have changed, taken before it runs.
 struct Snap {
     recording_ground: u64,
@@ -708,6 +716,28 @@ impl Session {
                 return Err(e);
             }
         }
+        Ok(())
+    }
+
+    /// A copy of this session's canvas as it stands (its paint, its wetness and drying) with
+    /// the session's clock, packed on disk like a resting canvas: for a scratch canvas set up
+    /// as a copy of the painting (`do --scratch --copy`). The canvas must be awake.
+    pub fn canvas_copy(&self) -> std::io::Result<CanvasCopy> {
+        let st = self.st.borrow();
+        let c = st.canvas.as_ref().ok_or_else(|| std::io::Error::other("there is no canvas to copy"))?;
+        Ok(CanvasCopy { snap: CanvasSnapshot::take(c)?, clock: st.clock, clock0: st.clock0 })
+    }
+
+    /// Take `copy` as this session's canvas, in place of the one it has, and its clock with it,
+    /// so that drying goes on as it would have on the canvas copied.
+    pub fn adopt_copy(&mut self, copy: CanvasCopy) -> std::io::Result<()> {
+        self.resting = None;
+        self.st.borrow_mut().canvas = None;
+        let c = copy.snap.restore()?;
+        let mut st = self.st.borrow_mut();
+        st.canvas = Some(c);
+        st.clock = copy.clock;
+        st.clock0 = copy.clock0;
         Ok(())
     }
 

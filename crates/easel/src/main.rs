@@ -521,8 +521,8 @@ fn client(cmd: &str, args: &[String], name: Option<String>) -> Result<(), String
         } else {
             false
         };
-        let target: Vec<String> = args.iter().filter(|a| *a == "--scratch" || *a == "--new").cloned().collect();
-        args.retain(|a| a != "--scratch" && a != "--new");
+        let target: Vec<String> = args.iter().filter(|a| *a == "--scratch" || *a == "--new" || *a == "--copy").cloned().collect();
+        args.retain(|a| a != "--scratch" && a != "--new" && a != "--copy");
         payload = match args.first().map(|s| s.as_str()) {
             Some("-f") => std::fs::read(args.get(1).ok_or("do -f <file>")?).map_err(|e| e.to_string())?,
             Some("-") => {
@@ -2027,13 +2027,20 @@ impl Server {
     }
 
     /// A command for the painting, or with `--scratch` for the scratch canvas beside it.
-    /// `do --scratch --new` puts the scratch canvas aside and starts a fresh one.
+    /// `do --scratch --new` puts the scratch canvas aside and starts a fresh one;
+    /// `do --scratch --copy` puts it aside and starts one that is a copy of the painting as it
+    /// stands (its paint, wetness and clock), so a passage can be tried on the painting's own
+    /// conditions before it is painted there.
     fn handle(&mut self, cmd: &str, args: &[String], payload: &str) -> Result<String, String> {
         let scratch = args.iter().any(|a| a == "--scratch");
         let new = args.iter().any(|a| a == "--new");
-        let args: Vec<String> = args.iter().filter(|a| *a != "--scratch" && *a != "--new").cloned().collect();
+        let copy = args.iter().any(|a| a == "--copy");
+        let args: Vec<String> = args.iter().filter(|a| *a != "--scratch" && *a != "--new" && *a != "--copy").cloned().collect();
         if new && !(scratch && cmd == "do") {
             return Err("--new starts a fresh scratch canvas: do --scratch --new".into());
+        }
+        if copy && !(scratch && cmd == "do") {
+            return Err("--copy starts a scratch canvas copied from the painting: do --scratch --copy".into());
         }
         if !scratch {
             // one canvas at a time is in memory: the scratch canvas rests while the
@@ -2048,13 +2055,22 @@ impl Server {
             return Err(format!("{cmd} is the painting's: it takes no --scratch"));
         }
         self.ready()?;
+        // --copy: the painting's canvas and clock as they stand, packed before the painting
+        // rests; the old scratch canvas goes first, so only the painting is in memory meanwhile
+        let painting_copy = if copy {
+            self.scratch = None;
+            self.s.wake().map_err(|e| format!("the painting couldn't be brought back: {e}"))?;
+            Some(self.s.canvas_copy().map_err(|e| format!("the painting couldn't be copied: {e}"))?)
+        } else {
+            None
+        };
         self.s.rest().map_err(|e| format!("the painting couldn't be put aside: {e}"))?;
         let mut out = String::new();
         // reopened when first asked for, so it never holds up the painting's reopen
-        if self.scratch.is_none() && !new {
+        if self.scratch.is_none() && !new && !copy {
             out += &self.resume_scratch();
         }
-        if new || (self.scratch.is_none() && cmd == "do") {
+        if new || copy || (self.scratch.is_none() && cmd == "do") {
             let fresh = self.new_scratch().map_err(|e| format!("{out}{e}"))?;
             out += &fresh;
         }
@@ -2064,6 +2080,13 @@ impl Server {
             return Err(format!("{out}{e}\n(the scratch canvas is put away; the next chunk painted on it starts a fresh one)"));
         }
         sc.s.wake().map_err(|e| format!("{out}the scratch canvas couldn't be brought back: {e}"))?;
+        if let Some(c) = painting_copy {
+            sc.s.adopt_copy(c).map_err(|e| format!("{out}the scratch canvas couldn't take the painting's copy: {e}"))?;
+            out += &format!(
+                "the scratch canvas is a copy of the painting as it stands ({}): its paint and its clock. Its palette, brushes and variables are its own, and its log can't rebuild it\n",
+                time::time_of_day(sc.s.st.borrow().clock)
+            );
+        }
         let reply = sc.serve_cmd(cmd, &args, payload).map_err(|e| format!("{out}{e}"))?;
         out += &reply;
         Ok(out)
