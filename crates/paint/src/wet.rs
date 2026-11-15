@@ -183,10 +183,21 @@ impl Latent {
     }
 
     pub(crate) fn add_parts(&mut self, other: &Self, weight: f32) {
-        for &(i, f) in &other.parts {
+        let mut grown = false;
+        for (k, &(i, f)) in other.parts.iter().enumerate() {
             match self.parts.iter_mut().find(|p| p.0 == i) {
                 Some(p) => p.1 += f * weight,
-                None => self.parts.push((i, f * weight)),
+                None => {
+                    // (the list grows once, by exactly the tubes this mix brings, not by
+                    // doubling: every pixel of a canvas keeps a list, and doubling left a
+                    // third of their room unused)
+                    if !grown {
+                        let more = other.parts[k..].iter().filter(|o| !self.parts.iter().any(|p| p.0 == o.0)).count();
+                        self.parts.reserve_exact(more);
+                        grown = true;
+                    }
+                    self.parts.push((i, f * weight))
+                }
             }
         }
     }

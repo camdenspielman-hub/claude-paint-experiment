@@ -228,15 +228,11 @@ impl Style {
             (dir.join(build).join(format!("{key}.ckpt")), key)
         });
         if let Some((path, key)) = &cache {
-            if let Ok(bytes) = std::fs::read(path) {
-                if bytes.len() >= 32 && Sha256::digest(&bytes[32..]).as_slice() == &bytes[..32] {
-                    if let Ok((cached, header)) = Canvas::read_state(&mut &bytes[32..]) {
-                        if header == *key {
-                            // (written with the drain switch on to keep the
-                            // paint's packing, below; prepared, it is off)
-                            return cached.with_drain(false).with_quarter_tiles(self.palette.quarter_tiles).with_glaze_film(self.palette.glaze_film).with_liquid_film_levels(self.palette.liquid_film_levels).with_sealed_drawing_guide(self.palette.sealed_drawing_guide).with_drawing_optics(self.palette.drawing_optics).with_rag_lift(self.palette.rag_lift).with_knife_skim(self.palette.knife_skim).with_blend_feather(self.palette.blend_feather).with_brush_skim(self.palette.brush_skim).with_material(self.palette.material);
-                        }
-                    }
+            if let Some((cached, header)) = read_cached_ground(path) {
+                if header == *key {
+                    // (written with the drain switch on to keep the
+                    // paint's packing, below; prepared, it is off)
+                    return cached.with_drain(false).with_quarter_tiles(self.palette.quarter_tiles).with_glaze_film(self.palette.glaze_film).with_liquid_film_levels(self.palette.liquid_film_levels).with_sealed_drawing_guide(self.palette.sealed_drawing_guide).with_drawing_optics(self.palette.drawing_optics).with_rag_lift(self.palette.rag_lift).with_knife_skim(self.palette.knife_skim).with_blend_feather(self.palette.blend_feather).with_brush_skim(self.palette.brush_skim).with_material(self.palette.material);
                 }
             }
         }
@@ -246,24 +242,28 @@ impl Style {
             // which only a draining canvas's checkpoint holds (version 14), so
             // a ground read back is the ground just prepared, bit for bit (the
             // caller sets the drain switch on either)
-            let mut bytes = Vec::new();
+            // (streamed through the digest into the file, not gathered in
+            // memory first: a prepared 2400 px ground is hundreds of MiB)
+            use std::io::{Seek, Write};
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let temp = path.with_extension(format!("{}-{}.tmp", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
             c.drain = c.engine >= 4;
-            let written = c.write_state(&mut bytes, &key).is_ok();
+            let saved = (|| -> std::io::Result<()> {
+                std::fs::create_dir_all(path.parent().unwrap())?;
+                let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+                let mut w = std::io::BufWriter::with_capacity(1 << 20, file);
+                // (the digest of what follows goes first: a placeholder until it is known)
+                w.write_all(&[0u8; 32])?;
+                let mut hashed = Hashed { inner: w, hash: Sha256::new() };
+                c.write_state(&mut hashed, &key)?;
+                let Hashed { inner: mut w, hash } = hashed;
+                w.seek(std::io::SeekFrom::Start(0))?;
+                w.write_all(&hash.finalize())?;
+                w.into_inner().map_err(|e| e.into_error())?;
+                std::fs::rename(&temp, &path)
+            })();
             c.drain = false;
-            if written {
-                use std::io::Write;
-                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let temp = path.with_extension(format!("{}-{}.tmp", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
-                let saved = (|| -> std::io::Result<()> {
-                    std::fs::create_dir_all(path.parent().unwrap())?;
-                    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
-                    file.write_all(&Sha256::digest(&bytes))?;
-                    file.write_all(&bytes)?;
-                    drop(file);
-                    std::fs::rename(&temp, &path)
-                })();
-                if saved.is_err() { let _ = std::fs::remove_file(temp); }
-            }
+            if saved.is_err() { let _ = std::fs::remove_file(temp); }
         }
         c.with_quarter_tiles(self.palette.quarter_tiles).with_glaze_film(self.palette.glaze_film).with_liquid_film_levels(self.palette.liquid_film_levels).with_sealed_drawing_guide(self.palette.sealed_drawing_guide).with_drawing_optics(self.palette.drawing_optics).with_rag_lift(self.palette.rag_lift).with_knife_skim(self.palette.knife_skim).with_blend_feather(self.palette.blend_feather).with_brush_skim(self.palette.brush_skim).with_material(self.palette.material)
     }
@@ -402,6 +402,51 @@ mod ground_optics_tests {
             }
         }
     }
+}
+
+/// A writer or reader that passes its bytes through a running SHA-256.
+struct Hashed<T> {
+    inner: T,
+    hash: sha2::Sha256,
+}
+
+impl<W: std::io::Write> std::io::Write for Hashed<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        sha2::Digest::update(&mut self.hash, &buf[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for Hashed<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        sha2::Digest::update(&mut self.hash, &buf[..n]);
+        Ok(n)
+    }
+}
+
+/// A prepared ground from the cache (`Style::prepare_cached`): its file is
+/// the SHA-256 of the rest, then a checkpoint (`Canvas::write_state`). Read
+/// only if the digest matches, so a torn or foreign file is never parsed;
+/// both passes stream from the one open file (a rename replacing the path
+/// meanwhile doesn't change what is read), never holding it in memory.
+fn read_cached_ground(path: &std::path::Path) -> Option<(Canvas, String)> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek};
+    let mut file = std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(path).ok()?);
+    let mut digest = [0u8; 32];
+    file.read_exact(&mut digest).ok()?;
+    let mut check = Hashed { inner: &mut file, hash: Sha256::new() };
+    std::io::copy(&mut check, &mut std::io::sink()).ok()?;
+    if check.hash.finalize().as_slice() != digest {
+        return None;
+    }
+    file.seek(std::io::SeekFrom::Start(32)).ok()?;
+    Canvas::read_state(&mut file).ok()
 }
 
 /// A brushed top ground: the paste is first spread with a broad hog brush

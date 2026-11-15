@@ -976,6 +976,7 @@ impl Canvas {
                     if !amount.is_finite() || amount < 0.0 || pixel.parts.iter().any(|p| p.0 == i) {
                         return Err(bad("checkpoint pigment list is invalid"));
                     }
+                    pixel.parts.reserve_exact(1);
                     pixel.parts.push((i, amount));
                 }
             }
@@ -1007,8 +1008,10 @@ impl Canvas {
                         let i = usize::try_from(get_u64(r)?).map_err(|_| bad("checkpoint layer pigment is invalid"))?;
                         let amount = get_f32(r)?;
                         if !amount.is_finite() || amount < 0.0 || lat.parts.iter().any(|p| p.0 == i) { return Err(bad("checkpoint layer pigment list is invalid")); }
+                        lat.parts.reserve_exact(1);
                         lat.parts.push((i, amount));
                     }
+                    pixel.layers.reserve_exact(1);
                     pixel.layers.push(crate::wet::Layer { share, lat, hide });
                 }
                 let sum: f32 = pixel.layers.iter().map(|l| l.share).sum();
