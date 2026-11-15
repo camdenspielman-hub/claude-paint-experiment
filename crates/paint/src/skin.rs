@@ -405,6 +405,11 @@ pub(crate) struct Film {
 }
 
 impl Film {
+    /// Bytes its buffers hold (`crate::memory`).
+    pub(crate) fn bytes(&self) -> usize {
+        4 * (self.top.capacity() + self.free.capacity()) + self.pool.capacity() * std::mem::size_of::<Packet>()
+    }
+
     fn push(&mut self, p: Packet) -> u32 {
         self.live += 1;
         match self.free.pop() {

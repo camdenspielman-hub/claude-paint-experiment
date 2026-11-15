@@ -203,6 +203,8 @@ impl Canvas {
             _ => batches(&order, &secs, slice),
         };
         let n_batches = batches.len();
+        // (counted for the easel's progress report only)
+        crate::progress::begin(ids.iter().map(|&n| u64::from(n)).sum());
         let mut offsets = vec![0u32; ids.len()];
         for (bi, (order, bsecs)) in batches.into_iter().enumerate() {
             let mut in_batch = order.clone();
@@ -216,7 +218,10 @@ impl Canvas {
             }
             let order = if regroup { disjoint_groups(&order, &rects).into_iter().flatten().collect() } else { order };
             let f = self.f;
-            let order: Vec<usize> = order.into_iter().filter(|&t| rects[t].is_some_and(|r| f.clip(r).is_some())).collect();
+            let order: Vec<usize> = order.into_iter().filter(|&t| rects[t].is_some_and(|r| f.clip(r).is_some()) || {
+                crate::progress::advance(u64::from(ids[t]));
+                false
+            }).collect();
             if std::env::var_os("PAINT_DEBUG").is_some() {
                 eprintln!("  {} tiles", order.len());
             }
@@ -226,10 +231,15 @@ impl Canvas {
             // done
             let stats = crate::engine7::stats().then(crate::engine7::BatchStats::default);
             let t0 = std::time::Instant::now();
+            let paint_counted = |t: usize| {
+                let dirty = paint(surf, t, first.wrapping_add(offsets[t]));
+                crate::progress::advance(u64::from(ids[t]));
+                dirty
+            };
             let dirty = if serial {
-                order.iter().map(|&t| paint(surf, t, first.wrapping_add(offsets[t]))).fold(None, union)
+                order.iter().map(|&t| paint_counted(t)).fold(None, union)
             } else {
-                run_ordered(&order, &rects, stats.as_ref(), |t| paint(surf, t, first.wrapping_add(offsets[t]))).into_iter().fold(None, union)
+                run_ordered(&order, &rects, stats.as_ref(), paint_counted).into_iter().fold(None, union)
             };
             if let Some(st) = &stats {
                 st.print(order.len(), t0.elapsed().as_secs_f64());

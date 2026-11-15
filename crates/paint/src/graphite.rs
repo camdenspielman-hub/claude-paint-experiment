@@ -548,6 +548,11 @@ pub fn hatch_marks_graded(m: &Mask, angle: f32, spacing: f32, length: f32, press
 }
 
 impl Drawing {
+    /// Bytes its buffers hold (`crate::memory`).
+    pub(crate) fn bytes(&self) -> usize {
+        self.cells.capacity() * std::mem::size_of::<Cell>() + 4 * (self.guide.capacity() + self.guide_floor.as_ref().map_or(0, Vec::capacity))
+    }
+
     fn new(n: usize, whole: usize, optics: bool) -> Self {
         Drawing { cells: vec![Cell { film: -1.0, optics: optics.then_some(Optics::default()), ..Cell::default() }; n], guide: vec![0.0; whole], guide_floor: None, sticks: false, optics }
     }

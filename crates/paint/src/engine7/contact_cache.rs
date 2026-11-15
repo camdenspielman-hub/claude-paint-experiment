@@ -43,6 +43,11 @@ pub(crate) struct ContactCache {
 }
 
 impl ContactCache {
+    /// Bytes its buffers hold (`crate::memory`).
+    pub(crate) fn bytes(&self) -> usize {
+        self.stale.capacity() + 4 * (self.seen.capacity() + self.base.capacity())
+    }
+
     fn rm(&self) -> usize {
         (3 * self.r).div_ceil(2).max(1)
     }

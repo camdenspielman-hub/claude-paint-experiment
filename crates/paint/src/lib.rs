@@ -13,6 +13,7 @@ pub mod crack;
 pub mod dry;
 pub mod drying;
 pub mod mask;
+pub mod memory;
 pub mod mixer;
 pub mod noise;
 pub mod path;
@@ -27,6 +28,7 @@ pub mod paper;
 pub mod pastel;
 pub mod pigment;
 pub mod prepared_optics;
+pub mod progress;
 pub mod rng;
 #[cfg(feature = "render-snapshot")]
 pub mod render_snapshot;
