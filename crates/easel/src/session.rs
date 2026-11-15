@@ -2483,7 +2483,7 @@ mod progress {
 
     #[test]
     fn a_kept_chunk_is_reported_as_in_the_log() {
-        let p = Progress { lines: AtomicUsize::new(6), line: AtomicUsize::new(5), marks0: AtomicU64::new(0), marks: AtomicU64::new(0), clock0: AtomicU64::new(0), clock: AtomicU64::new(0), kept: AtomicUsize::new(0) };
+        let p = Progress { lines: AtomicUsize::new(6), line: AtomicUsize::new(5), marks0: AtomicU64::new(0), marks: AtomicU64::new(0), clock0: AtomicU64::new(0), clock: AtomicU64::new(0), kept: AtomicUsize::new(0), pass0: AtomicU64::new(u64::MAX) };
         assert!(p.report(Duration::from_secs(3)).starts_with("painting a chunk (at line 5 of 6)"));
         p.keep(2);
         assert_eq!(p.report(Duration::from_secs(75)), "the chunk is in the log (chunk 2); the easel is finishing its reply, running for 1 min 15 s");

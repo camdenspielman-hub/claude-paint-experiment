@@ -37,6 +37,12 @@ impl Drop for Easel {
     }
 }
 
+/// `status` without its memory line: the session's own state (the easel process's memory
+/// moves with every request, a look's included).
+fn session_status(status: &str) -> String {
+    status.split("\nmemory: ").next().unwrap().to_string()
+}
+
 #[test]
 fn palette_heap_and_smear_show_retained_thinner_without_changing_the_session() {
     let mut images = Vec::new();
@@ -48,11 +54,11 @@ fn palette_heap_and_smear_show_retained_thinner_without_changing_the_session() {
         easel.ok(&["do", "canvas{size=300,aspect=1,linen=15,ground={{pile={{'lead white',1}},um=50,apply='knife'}}}"]);
         easel.ok(&["do", &format!("p=pile{{{{'cobalt blue',1}},thinner={thinner}}}")]);
         let log = easel.ok(&["log"]);
-        let status = easel.ok(&["status"]);
+        let status = session_status(&easel.ok(&["status"]));
         let (_, image) = easel.image(&["look", "--palette"]);
         assert_eq!(image.dimensions(), (1000, 230));
         assert_eq!(easel.ok(&["log"]), log);
-        assert_eq!(easel.ok(&["status"]), status);
+        assert_eq!(session_status(&easel.ok(&["status"])), status);
         images.push(image);
     }
     for (name, x, y, w, h) in [("heap", 20, 40, 80, 60), ("smear", 100, 40, 140, 165)] {
@@ -70,7 +76,7 @@ fn wide_crops_and_named_mask_overlays_are_read_only_in_every_canvas_view() {
     easel.ok(&["open", "view-test"]);
     easel.ok(&["do", "canvas{size=300,aspect=5,linen=15,ground={{pile={{'lead white',1}},um=50,apply='knife'}}}; shape=rect(200,40,400,160); soft=rect(600,40,800,160):soften(10); p=pile{{'lead white',1}}"]);
     let log = easel.ok(&["log"]);
-    let status = easel.ok(&["status"]);
+    let status = session_status(&easel.ok(&["status"]));
     let (plain_reply, plain) = easel.image(&["look"]);
     assert_eq!(plain.dimensions(), (1000, 200));
     assert!(!plain_reply.contains("scale"));
@@ -113,7 +119,7 @@ fn wide_crops_and_named_mask_overlays_are_read_only_in_every_canvas_view() {
         assert!(!result.status.success(), "{args:?}");
     }
     assert_eq!(easel.ok(&["log"]), log);
-    assert_eq!(easel.ok(&["status"]), status);
+    assert_eq!(session_status(&easel.ok(&["status"])), status);
 }
 
 #[test]

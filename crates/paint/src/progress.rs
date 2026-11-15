@@ -69,3 +69,19 @@ pub(crate) fn begin(total: u64) {
 pub(crate) fn advance(n: u64) {
     DONE.fetch_add(n, Ordering::Relaxed);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_time_left_follows_the_rate_so_far() {
+        let pass = |done, secs| Pass { number: 1, total: 400, done, elapsed: Duration::from_secs(secs) };
+        assert_eq!(pass(100, 30).eta(), Some(Duration::from_secs(90)));
+        assert_eq!(pass(300, 30).eta(), Some(Duration::from_secs(10)));
+        // nothing to go on yet, or nothing left
+        assert_eq!(pass(0, 30).eta(), None);
+        assert_eq!(pass(400, 30).eta(), None);
+        assert_eq!(Pass { elapsed: Duration::from_millis(100), ..pass(100, 0) }.eta(), None);
+    }
+}
