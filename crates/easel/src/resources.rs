@@ -72,18 +72,21 @@ pub fn size(bytes: u64) -> String {
 pub const PROCESS_BASE: u64 = 56 << 20;
 
 /// Bytes a painted pixel holds beyond the buffers every canvas allocates: the
-/// list of tubes its paint came from and any wet layers it keeps (measured on
-/// the sampler's study: 110 B/px after one sitting of three passes, 180 after
-/// two; it grows as more tubes and layers reach a pixel).
-pub const PAINTED_EXTRA: u64 = 180;
+/// list of tubes its paint came from, any wet layers it keeps, and a pencil
+/// underdrawing (measured on the sampler's study: tubes and layers 110 B/px
+/// after one sitting of three passes, 130 to 180 after two; a drawing 84; the
+/// tubes grow as more of them and more layers reach a pixel).
+pub const PAINTED_EXTRA: u64 = 220;
 
 /// What a chunk needs beside the canvas while it paints, looks and saves (a
 /// pass's scratch, the drying's buffers, a look's lit copy, the rollback's
-/// packing), as a share of the canvas (measured: 0.5 to 0.65).
-pub const WORKING_SHARE: f64 = 0.65;
+/// packing, memory the allocator keeps for the next pass), as a share of the
+/// canvas (measured: 0.5 to 0.65 replaying, 0.7 in a live sitting at 2400 px
+/// with a failed chunk and one stopped at the time limit).
+pub const WORKING_SHARE: f64 = 0.75;
 
-/// What a painting of `w × h` px will need: held between chunks once painted,
-/// and at its peak while a chunk runs, beside the memory this process may use.
+/// What a painting of `w × h` px will need: what its canvas holds once painted,
+/// and the easel's peak while a chunk runs, beside the memory it may use.
 pub struct Estimate {
     pub w: usize,
     pub h: usize,
@@ -95,7 +98,7 @@ pub struct Estimate {
 impl Estimate {
     pub fn new(w: usize, h: usize, engine: u32) -> Self {
         let canvas = paint::memory::estimate(w, h, engine) as u64 + (w * h) as u64 * PAINTED_EXTRA;
-        Estimate { w, h, held: PROCESS_BASE + canvas, peak: PROCESS_BASE + canvas + (canvas as f64 * WORKING_SHARE) as u64, limit: memory_limit() }
+        Estimate { w, h, held: canvas, peak: PROCESS_BASE + canvas + (canvas as f64 * WORKING_SHARE) as u64, limit: memory_limit() }
     }
 
     /// Whether the peak may not fit: above 80% of the limit (false if the limit is unknown).
@@ -103,12 +106,12 @@ impl Estimate {
         self.limit.is_some_and(|l| self.peak as f64 > 0.8 * l as f64)
     }
 
-    /// `a 2400×1800 px canvas: about 3.0 GiB once painted, near 4.6 GiB while a chunk
-    /// runs; this machine allows the easel 13.4 GiB`.
+    /// `a 2400×1600 px canvas holds about 2.8 GiB once painted, and the easel peaks near
+    /// 4.9 GiB while a chunk runs; this machine allows the easel 13.4 GiB`.
     pub fn describe(&self) -> String {
         let limit = self.limit.map_or(String::new(), |l| format!("; this machine allows the easel {}", size(l)));
         let warn = if self.tight() { " (it may run out of memory)" } else { "" };
-        format!("a {}×{} px canvas: about {} once painted, near {} while a chunk runs{limit}{warn}", self.w, self.h, size(self.held), size(self.peak))
+        format!("a {}×{} px canvas holds about {} once painted, and the easel peaks near {} while a chunk runs{limit}{warn}", self.w, self.h, size(self.held), size(self.peak))
     }
 }
 

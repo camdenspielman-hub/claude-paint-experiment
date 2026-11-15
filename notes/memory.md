@@ -51,6 +51,22 @@ original build's, and the gate's goldens pass.
   to a painting: `__gc` and `__mode` are refused, and every chunk ends with
   a full collection.
 
+## Measured
+
+On this sandbox (4 cores), each run against the original build (4bbbbec):
+
+| run | original | now | output |
+|---|---|---|---|
+| `easel run`, the sampler's study, 2 chunks at 600 px | 497 MiB peak, 83 s | 330 MiB, 79 s | checkpoint, PNG, state digests identical |
+| `easel run`, its first chunk at 1200 px | 1496 MiB peak | 1011 MiB (before the tube lists) | checkpoint, PNG identical |
+| starting a painting at 600 px from the ground cache (miss / hit) | 275 / 251 MiB | 153 / 187 MiB | identical to no cache |
+| live sitting at 2400 × 1600: brushed ground, pencil, a chunk, a failed chunk, a chunk stopped at the 600 s limit, a look | 5.3 GiB peak, 3.9 GiB after | 4.6 GiB peak, 3.6 GiB after | live checkpoints (2.6 GB) and logs identical |
+
+In that live sitting the sampler's second chunk ran past the easel's 600 s
+limit at 2400 px, in both builds, and was put back. Its passes are what
+take the time; `status` now says while it runs how much of its current pass
+is left.
+
 ## What the easel says
 
 - `status`: a `memory:` line with the canvas buffer by buffer, the easel
@@ -70,9 +86,11 @@ original build's, and the gate's goldens pass.
   process's peak during it.
 
 The estimates (crates/easel/src/resources.rs) are the buffers a canvas
-allocates (`paint::memory::estimate`) plus measured allowances: 180 bytes a
-pixel for painted paint's tube lists, 56 MiB for the process, 0.65 of the
-canvas for a chunk's working memory. A brushed ground takes about 3 s plus
+allocates (`paint::memory::estimate`) plus measured allowances: 220 bytes a
+pixel for painted paint's tube lists and a pencil underdrawing, 56 MiB for
+the process, 0.75 of the canvas for a chunk's working memory. Checked at
+2400 × 1600 px in a live sitting (below): the canvas held 2.7 GiB and the
+easel peaked at 4.6 GiB; the estimate now says 2.8 and 4.9. A brushed ground takes about 3 s plus
 50 µs a pixel to lay (measured 6 s at 300 px across, 15 at 600, 61 at 1200,
 186 at 2400, on 4 cores of which it uses one: its strokes depend on each
 other). A knife or roller ground takes seconds, and a ground in the cache
