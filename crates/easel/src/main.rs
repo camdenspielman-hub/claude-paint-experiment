@@ -32,6 +32,7 @@ mod output;
 mod live_frames;
 mod save;
 mod replay_checkpoint;
+mod resources;
 #[cfg(feature = "state-store")]
 mod painting_store;
 #[cfg(feature = "render-snapshot")]
@@ -158,6 +159,8 @@ const DEVELOPER_USAGE: &str = "easel: a live painting session (see notes/easel_g
   easel render-checkpoint <save.ckpt[.zst]> <out.png> [--mode color|gallery|relief] [--look] [--log painting.lua]
                       render saved state without replay or aging (default gallery; --look uses look sizing)
   easel tubes [--markdown]   the tubes in the box a new painting takes (--markdown: as a table)
+  easel estimate --aspect <width / height> [--width <px>]
+                      the memory a new painting of that shape needs here, and how long its ground takes
 
   A new painting takes its box from a file `box` next to this executable, else EASEL_BOX,
   else the default tube box; its log names the box (a line \"--@ box <name>\"), and every
@@ -204,6 +207,7 @@ fn main() -> ExitCode {
         "note" => note(&rest, name),
         "lock-journal" => lock_journal(),
         "tubes" => tubes(&rest),
+        "estimate" => estimate(&rest),
         "hash-probe" => {
             println!("{}", session::hash_probe());
             Ok(())
@@ -319,6 +323,37 @@ fn valid_name(n: &str) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------- tubes
+
+const ESTIMATE_USAGE: &str = "estimate --aspect <width / height> [--width <px>]";
+
+/// `easel estimate --aspect A [--width W]`: what a new painting of that shape will need of
+/// this machine, before it is begun: its memory once painted and while a chunk runs, beside
+/// the memory the easel may use here, and how long its brushed ground takes to lay.
+fn estimate(args: &[String]) -> Result<(), String> {
+    let mut i = 0;
+    let (mut aspect, mut width) = (None, None);
+    while i < args.len() {
+        let value = args.get(i + 1).ok_or_else(|| format!("{}: wants a value\n{ESTIMATE_USAGE}", args[i]))?;
+        match args[i].as_str() {
+            "--aspect" => aspect = Some(value.parse::<f32>().ok().filter(|a| (0.2..=5.0).contains(a)).ok_or_else(|| format!("--aspect {value}: width / height, 0.2 to 5"))?),
+            "--width" => width = Some(value.parse::<usize>().ok().filter(|w| session::WIDTHS.contains(w)).ok_or_else(|| format!("--width {value}: one of {:?}", session::WIDTHS))?),
+            o => return Err(format!("estimate: no option {o:?}\n{ESTIMATE_USAGE}")),
+        }
+        i += 2;
+    }
+    let aspect = aspect.ok_or_else(|| ESTIMATE_USAGE.to_string())?;
+    let width = match width {
+        Some(w) => w,
+        None => configured_width()?,
+    };
+    // (as `Canvas::new` rounds it)
+    let height = (width as f32 / aspect).round() as usize;
+    let engine = session::box_for(None)?.engine;
+    let e = resources::Estimate::new(width, height, engine);
+    println!("memory: {}", e.describe());
+    println!("time: {}", resources::ground_time(width, height));
+    Ok(())
+}
 
 /// `easel tubes [--markdown]`: the box a new painting here takes, as a list
 /// of names or as the guide's table.
@@ -2101,6 +2136,20 @@ impl Server {
         }
     }
 
+    /// `run_chunk`, with the canvas's source as it was before it (a chunk that changes it made
+    /// a canvas).
+    fn run_chunk_noting_canvas(&mut self, payload: &str) -> (Option<String>, Result<session::Ran, String>) {
+        let before = self.s.st.borrow().canvas_src.clone();
+        (before, self.run_chunk(payload))
+    }
+
+    /// What the canvas will need of the machine's memory, from its size (None: no canvas).
+    fn canvas_estimate(&self) -> Option<resources::Estimate> {
+        let engine = self.s.st.borrow().tubes.engine;
+        let f = self.s.canvas()?.window();
+        Some(resources::Estimate::new(f.full_w, f.full_h, engine))
+    }
+
     /// A fresh scratch canvas: the old one's log is put aside, and the new one is set up as
     /// the painting's canvas was (its `canvas{...}`, the easel's first chunk there).
     fn new_scratch(&mut self) -> Result<String, String> {
@@ -2123,15 +2172,26 @@ impl Server {
         self.ready()?;
         match cmd {
             "note" => append_note(self.s.st.borrow().clock, payload),
-            "status" => Ok(format!("{}\n", self.s.status())),
+            "status" => Ok(format!("{}\n{}\n", self.s.status(), resources::memory_line(self.s.memory().as_ref()))),
             "globals" => Ok(self.s.globals()),
-            "do" => match self.run_chunk(payload) {
-                Ok(ran) => {
+            "do" => match self.run_chunk_noting_canvas(payload) {
+                (before, Ok(ran)) => {
                     let note = self.save_log()?;
                     let n = self.s.log.len();
                     session::PROGRESS.keep(n);
                     let mut out = note;
                     out.push_str(&ran.out);
+                    // a chunk that made the canvas: what it will need of the machine's memory
+                    // (always in the server's log; in the reply for a developer, and for a
+                    // painter only when it may not fit)
+                    if self.s.st.borrow().canvas_src != before
+                        && let Some(e) = self.canvas_estimate()
+                    {
+                        eprintln!("memory: {}", e.describe());
+                        if !studio::painter() || e.tight() {
+                            out.push_str(&format!("memory: {}\n", e.describe()));
+                        }
+                    }
                     out.push_str(&format!("{}\n", time::time_of_day(self.s.st.borrow().clock)));
                     out.push_str(&format!("ok · chunk {n} ({:.2} s to compute)\n", ran.secs));
                     if args.iter().any(|a| a == "--look") {
@@ -2142,13 +2202,13 @@ impl Server {
                     }
                     Ok(out)
                 }
-                Err(e) if self.s.unrestored => Err(format!(
+                (_, Err(e)) if self.s.unrestored => Err(format!(
                     "{e}\n(the chunk failed and is not in the log; status reports the rebuild's progress and other commands must retry after it)"
                 )),
-                Err(e) if self.s.stale => Err(format!(
+                (_, Err(e)) if self.s.stale => Err(format!(
                     "{e}\n(the chunk failed and changed nothing. It had changed tables from earlier chunks, and though what they hold is back, how they are laid out (which decides the order `pairs` walks them in, from engine 3 only the length `#` finds in a table with holes) can't be put back, so the easel now rebuilds the painting from its log, as a reopen does; status reports progress and other commands must retry after that)"
                 )),
-                Err(e) => Err(format!("{e}\n(the chunk failed and changed nothing)")),
+                (_, Err(e)) => Err(format!("{e}\n(the chunk failed and changed nothing)")),
             },
             "look" => self.look(args, None),
             "probe" => self.probe(args),
@@ -2540,11 +2600,25 @@ fn run(args: &[String]) -> Result<(), String> {
     for (i, c) in chunks.iter().enumerate().skip(batch.done) {
         if batch.stopped() { break; }
         batch.begin_chunk(i + 1)?;
+        let had_canvas = s.st.borrow().canvas_src.clone();
         let r = s.run(c).map_err(|e| format!("chunk {} failed:\n{e}", i + 1))?;
+        if s.st.borrow().canvas_src != had_canvas
+            && let Some(f) = s.canvas().map(|c| c.window())
+        {
+            eprintln!("  memory: {}", resources::Estimate::new(f.full_w, f.full_h, s.st.borrow().tubes.engine).describe());
+        }
         #[cfg(feature = "state-store")]
         if let Some(store) = &mut store { store.publish(&s, &s.program(&stem)).map_err(|e| format!("state publication after chunk {} failed: {e}", i + 1))?; }
         print!("{}", r.out);
         eprintln!("  chunk {:>3}  {:>7.2}s", i + 1, r.secs);
+        if std::env::var_os("EASEL_MEMORY_TRACE").is_some()
+            && let Some(c) = s.canvas()
+        {
+            let (now, peak) = resources::process_memory().unwrap_or_default();
+            eprintln!("  memory after chunk {}: canvas {} · process {} (peak during the chunk {})", i + 1, c.memory().summary(), resources::size(now), resources::size(peak));
+            // (the next chunk's peak is its own: Linux resets the high-water mark on "5")
+            let _ = std::fs::write("/proc/self/clear_refs", "5");
+        }
         if paint::engine7::stats() {
             eprintln!("E7CHUNK	{}	{:.6}", i + 1, r.secs);
         }
@@ -2567,7 +2641,8 @@ fn run(args: &[String]) -> Result<(), String> {
     if let Some(d) = flag(args, "--dump-state") {
         state_dump::write_save(&s, &text, Path::new(&d))?;
     }
-    let c = s.canvas().ok_or("the program never made a canvas")?.clone();
+    // (borrowed, not cloned: a copy of a painted canvas is as large as the canvas)
+    let c = s.canvas().ok_or("the program never made a canvas")?;
     if frames {
         frames::finish(&c);
         let rec = frames::stop().ok_or("frames: the recorder went away")?;
