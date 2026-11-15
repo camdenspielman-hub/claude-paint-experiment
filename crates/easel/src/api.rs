@@ -1196,7 +1196,10 @@ thread_local! {
     /// so without this a loop of mask operations piles up gigabytes.
     static GC: RefCell<(Option<mlua::WeakLua>, usize)> = const { RefCell::new((None, 0)) };
 }
-const GC_EVERY_BYTES: usize = 400 << 20;
+/// (128 MiB: eight masks of a 2400 px canvas. Collecting is cheap beside a mask, and what
+/// waits for it is memory a sandbox's limit counts; when Lua collects is invisible to a
+/// painting: `__gc` and `__mode` are refused, and the chunk ends with a full collection.)
+const GC_EVERY_BYTES: usize = 128 << 20;
 
 pub(crate) fn wrap(m: Mask) -> M {
     note_bytes(m.data.len() * 4);
