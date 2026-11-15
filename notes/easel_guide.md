@@ -30,7 +30,7 @@ done. Its tools:
 | `look` | shows you the canvas as it is now, or your palette (see [Looking](#looking)) |
 | `probe` | gives the paint at a point (`at: "x,y"`) or averaged over an area (`crop: "x0,y0,x1,y1"`) in numbers: its color and value from 0 to 255 without the gallery's light, the color as a look without a mode shows it; the same two in the gallery's light, the color as mode `gallery` shows it and the value as mode `value` shows it; and whether it is open, setting, tacky or dry; it can't tell which piles the paint came from |
 | `note` | adds an entry to your journal (see [The journal](#the-journal)) |
-| `status` | the canvas's setup; while a chunk is still running, how far it has got; while the easel rebuilds the painting from its log, how many of its chunks are done |
+| `status` | the canvas's setup and the memory the easel holds (the canvas, the easel at its peak, and the most it may use here); while a chunk is still running, how far it has got; while the easel rebuilds the painting from its log, how many of its chunks are done |
 | `log` | the painting so far: every chunk that ran, each after a line `--@ chunk`; with `find: "<text>"`, only the lines that hold that text, each with its line number and the two lines before and after it |
 | `read` | reads a file in this folder, such as your brief or your notes; on a folder, lists what is in it |
 | `reference` | searches the reference library or reads from it: `query: "<words>"` gives the `id` and title of each entry that holds all the words, in any case; `id: "<id>"` gives that entry's text a page at a time, with `page` to choose one and `next_page` naming the next (null on the last) |
@@ -115,7 +115,9 @@ toward you, a faint veil of white over the colors that lifts the darks; a
 glossy one sends it away. The looks show it.
 
 It sets `W` (1000) and `H` (`1000 / aspect`). The canvas is always 1000
-units wide, whatever its pixel width. The origin `(0, 0)` is the upper
+units wide, whatever its pixel width. Its pixels hold the paint, so a taller
+canvas (a smaller aspect) needs more memory; if a canvas may need more than
+the easel can use where it runs, the reply to `canvas{}` says so. The origin `(0, 0)` is the upper
 left corner; x increases to the right and y downward. Angles are radians,
 0 left to right, π/2 downward.
 

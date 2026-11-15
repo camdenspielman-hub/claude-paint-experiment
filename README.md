@@ -15,6 +15,9 @@ cargo build --release -p easel        # the easel: target/release/easel
 scripts/test                          # the gate (notes/speed/SKIPPED.md: what it runs and what it doesn't)
 ```
 
+- `easel estimate --aspect 1.33` says how much memory a painting of that
+  shape needs here and how long its ground takes; `easel status` says what
+  a running one holds (`notes/memory.md`).
 - `notes/easel_guide.md`: how to paint at the easel.
 - `notes/techniques.md`: planning, looking, glazing, scumbling and controlling passes with these tools.
 - `notes/journal.md`: your working journal (`easel note '...'` adds to it).

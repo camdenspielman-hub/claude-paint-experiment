@@ -1,0 +1,92 @@
+# Memory and time: what a painting costs, and how the easel says so
+
+## Where the memory goes
+
+A canvas keeps every pixel's paint in memory. On an engine-9 painting
+(every new one), after a sitting or two, a pixel holds about 700 bytes:
+
+| part | bytes a pixel | what it is |
+|---|---|---|
+| wet paint | 292 | the wet film's volume, its 48-lane pigment latent, its ten properties, cover and floor |
+| spectral backing | 176 | the dry picture under the wet paint as a 38-band spectrum (engine 9) |
+| tubes and layers | 110–180, growing | each pixel's list of the tubes its paint came from, and any skim layers it keeps |
+| the rest | ~100 | the picture, relief, contact level, stroke ids, solvent, drying state |
+
+So a 2400 × 1800 px canvas holds about 3 GiB once painted, a 4800 px one
+about four times that. The tube lists grow as more tubes and layers reach a
+pixel. `Canvas::memory` (crates/paint/src/memory.rs) lists the parts of a
+real canvas; `status` prints it.
+
+While a chunk runs the easel needs more beside the canvas: a pass's scratch,
+the drying's buffers, a look's lit copy, the Lua state and its masks (a mask
+is a whole-canvas float buffer Lua sees only as a small userdata). Measured
+on the sampler's study, the peak is 1.5 to 1.65 times the canvas, plus about
+55 MiB for the process.
+
+## What changed (and what each saved)
+
+All of these keep every result as it was: on the sampler's study, the
+checkpoint, the PNG and every chunk's state digest are byte for byte the
+original build's, and the gate's goldens pass.
+
+- **`easel run` no longer clones the finished canvas** to render and save it.
+  It borrows it. One canvas less at the end of every replay.
+- **The ground cache streams.** It gathered the whole prepared canvas in
+  memory to digest it on both the write and the read, 80% above the canvas
+  at the moment a painting begins. It now streams through the digest; the
+  file format is the same.
+- **Tube lists keep to their size.** They grew by doubling from four slots,
+  so 40% of their room was unused, a third of the canvas's heap. A list now
+  grows once per mix by exactly the tubes the mix brings (and a checkpoint
+  builds its lists to size). Fewer reallocations made passes a little faster.
+- **The rollback's buffers go into its packed file.** Before every live chunk
+  the canvas is packed into a compressed temporary file so a failed chunk can
+  be put back; the buffers the checkpoint leaves out were copied in memory
+  beside the canvas for the whole chunk: floors, ceilings and solvent (16
+  bytes a pixel), all property lanes without the drain switch (40), and the
+  whole drawing (about 80). They are now written raw ahead of the state in
+  the same file (`checkpoint::tests::a_packed_canvas_unpacks_bit_for_bit`).
+- **Lua collects every 128 MiB of masks**, not every 400 MiB (24 masks of a
+  2400 px canvas waited for the collector). When Lua collects is invisible
+  to a painting: `__gc` and `__mode` are refused, and every chunk ends with
+  a full collection.
+
+## What the easel says
+
+- `status`: a `memory:` line with the canvas buffer by buffer, the easel
+  process's resident memory and its peak, and the limit it runs under (the
+  tightest of the machine's RAM and its cgroups' `memory.max` or
+  `memory.limit_in_bytes`). The first line is unchanged.
+- While a chunk runs, `status` says how much of its current pass is painted
+  and about how long is left at its rate so far (`paint::progress`). The
+  painters' clients already drop the running time from that line.
+- The chunk that makes a canvas: what it will need once painted and near
+  what while a chunk runs, beside the limit. A developer's easel puts it in
+  the reply; a painter's only when the peak may pass 80% of the limit. The
+  server log and `easel run` always print it.
+- `easel estimate --aspect A [--width W]`: the same before a painting is
+  begun, and how long its brushed ground takes to lay.
+- `EASEL_MEMORY_TRACE=1 easel run …`: each chunk's canvas memory and the
+  process's peak during it.
+
+The estimates (crates/easel/src/resources.rs) are the buffers a canvas
+allocates (`paint::memory::estimate`) plus measured allowances: 180 bytes a
+pixel for painted paint's tube lists, 56 MiB for the process, 0.65 of the
+canvas for a chunk's working memory. A brushed ground takes about 3 s plus
+50 µs a pixel to lay (measured 6 s at 300 px across, 15 at 600, 61 at 1200,
+186 at 2400, on 4 cores of which it uses one: its strokes depend on each
+other). A knife or roller ground takes seconds, and a ground in the cache
+(same size, seed and build) is read back in a second or two.
+
+## Not changed, and why
+
+- **The physics kernel's time.** Most of a pass is `bristle::exchange` and
+  `Surf::add`/`take` (a callgrind profile of a brushed ground: 94% inside
+  `exchange`). Making it faster without changing a single float is a careful
+  project of its own; the brushed ground in particular runs one stroke after
+  another by design.
+- **The per-pixel layout.** The 48-lane latent (192 bytes) and the 38-band
+  backing (176) are most of a pixel. A sparse layout would cut them for
+  pixels without wet paint, but every pixel's stale latent still shapes the
+  bits of the next paint laid there, so it is a format change, not a
+  cleanup.
