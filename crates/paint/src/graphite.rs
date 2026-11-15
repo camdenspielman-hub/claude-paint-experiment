@@ -254,14 +254,14 @@ pub struct Drawing {
     /// perfectly smooth ground (the lead's rate and cap at the pressure),
     /// with no tooth, no grain and no wet paint to skip, so it is continuous
     /// along the line and the same in a crop render and a whole one.
-    guide: Vec<f32>,
+    pub(crate) guide: Vec<f32>,
     /// What fixative bound of the guide: the eraser can't lift below this.
-    guide_floor: Option<Vec<f32>>,
+    pub(crate) guide_floor: Option<Vec<f32>>,
     /// Whether a pastel stick's pastel has landed in the tooth (or the
     /// finger has moved some): the cells are then serialized with their
     /// color and the pastel in the tooth (`to_f32s`).
     pub(crate) sticks: bool,
-    optics: bool,
+    pub(crate) optics: bool,
 }
 
 /// How much of the point touches at pressure `p`: none at 0, rising
