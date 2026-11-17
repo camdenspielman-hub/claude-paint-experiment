@@ -406,7 +406,14 @@ impl Latent {
         }
     }
 
+    #[inline]
     pub(crate) fn add_parts(&mut self, other: &Self, weight: f32) {
+        if other.parts.is_empty() { return; }
+        self.add_parts_lists(other, weight);
+    }
+
+    #[inline(never)]
+    fn add_parts_lists(&mut self, other: &Self, weight: f32) {
         self.add_parts_scaled::<false>(other, weight, 1.0);
     }
 
@@ -494,9 +501,16 @@ impl Latent {
         for p in &mut self.parts { p.1 *= weight; }
     }
 
+    #[inline]
     pub(crate) fn blend_parts(&mut self, other: &Self, weight: f32) {
-        self.layers = Vec::new();
+        // (a list that never held a buffer has nothing to free)
+        if self.layers.capacity() != 0 { self.layers = Vec::new(); }
         if self.parts.is_empty() && other.parts.is_empty() { return; }
+        self.blend_parts_lists(other, weight);
+    }
+
+    #[inline(never)]
+    fn blend_parts_lists(&mut self, other: &Self, weight: f32) {
         self.add_parts_scaled::<true>(other, weight, 1.0 - weight);
         self.parts.retain(|p| p.1 > 0.0);
     }
