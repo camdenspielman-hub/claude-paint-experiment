@@ -73,6 +73,20 @@ Instructions (callgrind, one thread), unchanged build -> now:
 | bunny: an engine-3 log with pencil, 200 px | 27.9 G | 21.3 G | -24% (1.31x) |
 | legacy: legacy verbs, engine 1, 128 px | 65.7 G | 53.5 G | -19% (1.23x) |
 
+Time on the 4-core machine it was measured on, nothing else running, no
+ground cache, `easel run` at the painting's width (aspect 1.5), the PNGs
+identical:
+
+| run | before | after | |
+|---|---|---|---|
+| a brushed ground, 2400 px | 186.7 s | 136.9 s | -27% |
+| the sampler's study, two chunks, 1200 px | 230.6 s | 149.5 s | -35% |
+| the same at 2400 px | 900.4 s | 587.4 s | -35% |
+| its second chunk (passes over wet paint) | 615.5 s | 360.2 s | -41% |
+
+That second chunk ran past the easel's 600 s limit for a chunk before (in a
+live sitting it was stopped at 636 s and put back); it now takes six minutes.
+
 
 Checked: `scripts/exact_ab` (31 scenes, engines 1 to 9, 128 to 1200 px, one
 to four threads) byte for byte against the unchanged build; the paint
