@@ -599,9 +599,13 @@ unsafe fn contact(seg: SegmentInput<'_>, bounds: &mut Bounds, win: &mut Window) 
             }
             lat.parts.clear();
             lat.parts.extend(c.parts.iter().map(|&(i, f)| (i, f * inv)));
-            for k in 0..LAT {
-                lat[k] = c.a[LAT0 + k] * inv;
+            // (scaled in a copy of its own, which the compiler vectorizes:
+            // it can't tell `lat` from the cell)
+            let mut color: [f32; LAT] = c.a[LAT0..LAT0 + LAT].try_into().unwrap();
+            for x in &mut color {
+                *x *= inv;
             }
+            lat.color = color;
             let mut hide: Prop = [0.0; 10];
             for k in 0..hide.len() {
                 hide[k] = c.a[HIDE0 + k] * inv;
