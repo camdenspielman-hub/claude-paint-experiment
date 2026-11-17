@@ -21,7 +21,7 @@ and without long waits (dry, paint).
   `take_with_lat`, `lay_layers`, `add_parts` and `split_top` were some 70%
   of all instructions, allocation 11%. The kernel's own arithmetic was a
   minority.
-- **The old kernel** (engines 1 to 6, and brushed grounds) cloned latents it
+- **The old kernel** (the engines before 7, and every brushed ground) cloned latents it
   only read, returned 290-byte tuples to throw most of them away, dropped an
   always-empty vector on every mix, converted plough targets with saturating
   casts and called libm for floor.
@@ -46,7 +46,10 @@ What makes each one exact: the same IEEE operations on the same values in
 the same order (no reassociation, no fused multiply-add, no changed
 precision or libm), the same entries in the same order in every tube and
 layer list, the same RNG draws, and scratch reset to a fresh value's bits
-before each use. Every change was proposed with that argument and attacked
+before each use. Two changes use different operations proven to give the
+same result on every input: the inline floor and ceil (checked on all 2^32
+floats) and the plough's float bounds test (exact below 2^24, the old test
+above; checked by a debug assertion on every target). Every change was proposed with that argument and attacked
 by two reviewers before it was written (one on float semantics, one on
 state, ordering and side effects; 6 of 37 proposals fell). The new tests
 compare the old and new paths bit for bit (`splitting_in_place_matches_split_top`,
@@ -56,9 +59,10 @@ compare the old and new paths bit for bit (`splitting_in_place_matches_split_top
 
 One edge is not fixed and never was: when both operands of a float sum are
 NaN, which payload survives depends on operand order, which the compiler may
-choose (Rust doesn't fix NaN payloads). A painting's tube amounts and shares
-are never NaN (a checkpoint refuses them); for every finite value the new
-paths match bit for bit.
+choose (Rust doesn't fix NaN payloads). Reading a checkpoint refuses
+non-finite tube amounts and layer shares, so a painting that can be saved and
+reopened holds none; for every finite value the new paths match bit for bit.
+The new tests compare NaN results only as NaN.
 
 ## Measured
 
@@ -88,8 +92,11 @@ That second chunk ran past the easel's 600 s limit for a chunk before (in a
 live sitting it was stopped at 636 s and put back); it now takes six minutes.
 
 
-Checked: `scripts/exact_ab` (31 scenes, engines 1 to 9, 128 to 1200 px, one
-to four threads) byte for byte against the unchanged build; the paint
+Checked: `scripts/exact_ab --full` (31 scenes painted with engines 1, 3 and
+9, 128 to 1200 px, one to four threads) against the unchanged build: PNGs,
+checkpoints and printed output byte for byte, state digests apart from their
+timing field. Engines 2, 4 and 5 share engine 3's kernel and 7 and 8 share
+engine 9's, but no scene paints with them; the paint
 crate's unit tests (the one failure, `knife_skim::a_skimming_knife_keeps_its_light_on_wet_dark_paint`,
 is the gate's registered known failure and fails with the same numbers
 before and after); and `scripts/test`.
@@ -102,8 +109,8 @@ before and after); and `scripts/test`.
   would keep the bits, but a simulation of that graph found about 1.5-fold
   parallelism on the ground and none elsewhere, for a large and delicate
   change. Not attempted.
-- **AVX for the 48-lane lerp.** Exact (the same lane-wise operations), but
-  x86 only and behind a runtime check; the paintings run on Apple silicon.
+- **AVX for the 48-lane lerp in `Surf::add`.** Exact (the same lane-wise
+  operations), but x86 only, behind a runtime CPU check, and no help on ARM.
 - Smaller items under 0.1% each (a prepared spectral ground, the wait
   path's scratch, one `seen` per look request).
 

@@ -7,7 +7,8 @@
 # Each scene is a log replayed at a small width with a set thread count by
 # both builds; the PNG, the checkpoint (--checkpoint-out), what the chunks
 # printed and every chunk's state digest (--state-digest, without its time)
-# must be the same bytes. The scenes cover engines 1, 3, 4, 5 and 9: the
+# must be the same bytes. The scenes paint with engines 1, 3 and 9 (2, 4 and
+# 5 share engine 3's kernel, 7 and 8 engine 9's): the
 # old-log cases (crates/easel/tests/old_logs), and in
 # scripts/tests/exact_scenes the sampler's study (brushed ground, turps,
 # passes, a day and four days of waiting), its plates (loading, broken colour,
