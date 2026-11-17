@@ -998,15 +998,8 @@ impl Surf {
             self.film_give(i, v);
             let vol = &mut *self.vol.add(i);
             if self.layers && !(*self.lat.add(i)).layers.is_empty() {
-                let mut below = (*self.lat.add(i)).take_scaled_layers(*vol, *self.hide.add(i));
-                let (mut taken, mut picked, mut got) = (0.0f32, Latent::default(), [0.0f32; 10]);
-                Latent::split_top_in_place(&mut below, *vol, v, self.drain, &mut taken, &mut picked, &mut got);
-                let (left, lat, hide) = Latent::from_layers(below);
-                *vol = left;
-                *self.lat.add(i) = lat;
-                *self.hide.add(i) = hide;
-                if self.cure_now && *vol < 1e-5 && !self.dry.is_null() { (*self.dry.add(i)).cure = 0.0; }
-                return (if self.drain { fluid_of(got) } else { got }, Some(picked));
+                let mut picked = Latent::default();
+                return (self.take_layers(i, v, &mut picked), Some(picked));
             }
             let got = if self.drain { take_from(&mut *self.hide.add(i), *vol, v) } else { *self.hide.add(i) };
             *vol -= v;
@@ -1014,6 +1007,41 @@ impl Surf {
                 (*self.dry.add(i)).cure = 0.0;
             }
             (got, None)
+        }
+    }
+
+    /// `take_with_lat` into a scratch latent: the paint a layered pixel
+    /// gives is mixed into `picked` (set to `Latent::default()`'s paint
+    /// first) and the flag is true; a pixel without layers leaves `picked`
+    /// as it was.
+    #[inline]
+    pub(crate) unsafe fn take_into(&self, i: usize, v: f32, picked: &mut Latent) -> (Prop, bool) {
+        unsafe {
+            if self.layers && !(*self.lat.add(i)).layers.is_empty() {
+                self.film_give(i, v);
+                debug_assert!(picked.layers.is_empty());
+                picked.color = [0.0; LAT];
+                picked.parts.clear();
+                return (self.take_layers(i, v, picked), true);
+            }
+            (self.take(i, v), false)
+        }
+    }
+
+    /// `take_with_lat` of a layered pixel, after `film_give`: the top `v`
+    /// of its layers is mixed into `picked`, which holds no paint.
+    unsafe fn take_layers(&self, i: usize, v: f32, picked: &mut Latent) -> Prop {
+        unsafe {
+            let vol = &mut *self.vol.add(i);
+            let mut below = (*self.lat.add(i)).take_scaled_layers(*vol, *self.hide.add(i));
+            let (mut taken, mut got) = (0.0f32, [0.0f32; 10]);
+            Latent::split_top_in_place(&mut below, *vol, v, self.drain, &mut taken, picked, &mut got);
+            let (left, lat, hide) = Latent::from_layers(below);
+            *vol = left;
+            *self.lat.add(i) = lat;
+            *self.hide.add(i) = hide;
+            if self.cure_now && *vol < 1e-5 && !self.dry.is_null() { (*self.dry.add(i)).cure = 0.0; }
+            if self.drain { fluid_of(got) } else { got }
         }
     }
 

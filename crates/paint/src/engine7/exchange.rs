@@ -438,6 +438,7 @@ unsafe fn contact(seg: SegmentInput<'_>, bounds: &mut Bounds, win: &mut Window) 
         let mut got = [0.0f32; PACK];
         let mut got_parts = std::mem::take(&mut win.got_parts);
         got_parts.clear();
+        let mut picked_buf = win.picked.take().unwrap_or_default();
         let mut got_s = 0.0f32;
         let mut laid_liq = 0.0f32;
         let mut ploughed = 0.0f32;
@@ -471,10 +472,11 @@ unsafe fn contact(seg: SegmentInput<'_>, bounds: &mut Bounds, win: &mut Window) 
                     }
                     // (the paint lifted: with the drain switch from the top
                     // down, `bristle::take_from`; without, the film's)
-                    let (hp, picked) = sf.take_with_lat(i, tk);
-                    accumulate(&mut got, &packed(sf, i, &hp, cure, picked.as_ref()), tk * px_area);
-                    let source = picked.as_ref().unwrap_or(&*sf.lat.add(i));
-                    gather(&mut got_parts, &source.parts, tk * px_area, &mut distinct_if_picked(picked.as_ref()));
+                    let (hp, layered) = sf.take_into(i, tk, &mut picked_buf);
+                    let picked = layered.then_some(&*picked_buf);
+                    accumulate(&mut got, &packed(sf, i, &hp, cure, picked), tk * px_area);
+                    let source = picked.unwrap_or(&*sf.lat.add(i));
+                    gather(&mut got_parts, &source.parts, tk * px_area, &mut distinct_if_picked(picked));
                 }
             }
             if dep_per_w > 0.0 && !capped && phi <= 0.0 {
@@ -564,12 +566,13 @@ unsafe fn contact(seg: SegmentInput<'_>, bounds: &mut Bounds, win: &mut Window) 
                 // cure it had, the cover it brings (fine tools) and its
                 // solvent (µm), in the film's proportions (m ≤ v, so these
                 // never move more than is there)
-                let (hp, picked) = sf.take_with_lat(i, out_m);
-                let mut src = packed(sf, i, &hp, cure, picked.as_ref());
+                let (hp, layered) = sf.take_into(i, out_m, &mut picked_buf);
+                let picked = layered.then_some(&*picked_buf);
+                let mut src = packed(sf, i, &hp, cure, picked);
                 src[COVER] = src_cover;
                 src[SOLV] = src_solv;
-                let source = picked.as_ref().unwrap_or(&*sf.lat.add(i));
-                let mut distinct = distinct_if_picked(picked.as_ref());
+                let source = picked.unwrap_or(&*sf.lat.add(i));
+                let mut distinct = distinct_if_picked(picked);
                 for &(tx, ty, j, mm) in &moves[..n_moves] {
                     let cell = win.cell(tx, ty, j, || unreachable!("a plough cell is started before its paint lands"));
                     accumulate(&mut cell.a, &src, mm);
@@ -580,6 +583,7 @@ unsafe fn contact(seg: SegmentInput<'_>, bounds: &mut Bounds, win: &mut Window) 
         }
         win.hits = hits;
         win.weights = weights;
+        win.picked = Some(picked_buf);
         // the ploughed paint lands, one add per destination pixel
         let (cells, lat) = win.hit_cells();
         debug_assert!(lat.layers.is_empty());

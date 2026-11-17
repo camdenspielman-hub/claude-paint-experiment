@@ -75,6 +75,9 @@ pub struct Window {
     pub(crate) got_l: crate::wet::Latent,
     /// Scratch for the paint landing in a cell.
     land: crate::wet::Latent,
+    /// Scratch for the paint a layered pixel gives up (`Surf::take_into`),
+    /// boxed so a contact moves it out and back as a pointer.
+    pub(crate) picked: Option<Box<crate::wet::Latent>>,
 }
 
 impl Window {
