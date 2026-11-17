@@ -199,12 +199,12 @@ pub(crate) unsafe fn exchange(
 ) {
     // (the capsule's rectangle is at most |b − a| + 2·rb + 4 pixels a side)
     if ((b.0 - a.0).abs() + 2.0 * rb + 4.0) * ((b.1 - a.1).abs() + 2.0 * rb + 4.0) > window::CAPACITY as f32 {
-        unsafe { crate::bristle::exchange(sf, br, tool, a, b, rb, reach, full, dep, excl, clip, id, wts, bounds, lim) };
+        unsafe { crate::bristle::exchange(&sf, br, tool, a, b, rb, reach, full, dep, excl, clip, id, wts, bounds, lim) };
         return;
     }
     let seg = SegmentInput { sf, bristle: &mut *br, tool, a, b, rb, reach, full, dep, excl, clip, stroke_id: id, limit: lim };
     if window::with(|w| unsafe { contact(seg, bounds, w) }).is_none() {
-        unsafe { crate::bristle::exchange(sf, br, tool, a, b, rb, reach, full, dep, excl, clip, id, wts, bounds, lim) };
+        unsafe { crate::bristle::exchange(&sf, br, tool, a, b, rb, reach, full, dep, excl, clip, id, wts, bounds, lim) };
     }
 }
 

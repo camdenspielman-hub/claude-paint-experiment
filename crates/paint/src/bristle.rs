@@ -860,6 +860,12 @@ impl Surf {
     /// bristle feels the film as it now is, not as it was at the last wait.
     #[inline]
     pub(crate) unsafe fn add(&self, i: usize, v: f32, lat: &Latent, hide: Prop, cure: f32) {
+        unsafe { self.add_old(i, v, lat, hide, cure) }
+    }
+
+    /// `add`, inlined into the old kernel's pixel loop (`exchange`).
+    #[inline(always)]
+    pub(crate) unsafe fn add_old(&self, i: usize, v: f32, lat: &Latent, hide: Prop, cure: f32) {
         unsafe {
             if v <= 0.0 {
                 return;
@@ -940,6 +946,27 @@ impl Surf {
         }
     }
 
+    /// `lay`, for the old kernel (`exchange`): its guards inline, the
+    /// skimming body out of line (brush skim is engine 7 on, where the old
+    /// kernel is only the fallback).
+    #[inline(always)]
+    pub(crate) unsafe fn lay_old(&self, i: usize, v: f32, lat: &Latent, hide: Prop, cure: f32) {
+        if self.drain && v <= 0.0 {
+            return;
+        }
+        if self.skim <= 0.0 {
+            return unsafe { self.add_old(i, v, lat, hide, cure) };
+        }
+        unsafe { self.lay_skimmed(i, v, lat, hide, cure) }
+    }
+
+    /// (`lay` past its guards, which it checks again to the same effect)
+    #[cold]
+    #[inline(never)]
+    unsafe fn lay_skimmed(&self, i: usize, v: f32, lat: &Latent, hide: Prop, cure: f32) {
+        unsafe { self.lay(i, v, lat, hide, cure) }
+    }
+
     pub(crate) unsafe fn lay_layers(&self, i: usize, v: f32, lat: &Latent, hide: Prop, cure: f32, skim: f32) {
         if v <= 0.0 { return; }
         unsafe {
@@ -979,6 +1006,25 @@ impl Surf {
             if !self.layers || (*self.lat.add(i)).layers.is_empty() { return None; }
             Some((*self.lat.add(i)).peek_top(*self.vol.add(i), *self.hide.add(i), v, self.drain))
         }
+    }
+
+    /// `pickup_lat`, for the old kernel (`exchange`): a pixel without
+    /// layers gives None inline.
+    #[inline(always)]
+    pub(crate) unsafe fn pickup_lat_old(&self, i: usize, v: f32) -> Option<Latent> {
+        unsafe {
+            if !self.layers || (*self.lat.add(i)).layers.is_empty() {
+                return None;
+            }
+            self.pickup_lat_layered(i, v)
+        }
+    }
+
+    /// (`pickup_lat` past its guard, which it checks again to the same effect)
+    #[cold]
+    #[inline(never)]
+    unsafe fn pickup_lat_layered(&self, i: usize, v: f32) -> Option<Latent> {
+        unsafe { self.pickup_lat(i, v) }
     }
 
     /// The share (0..1) of what a bristle lays or ploughs that pixel `i`
@@ -1607,7 +1653,7 @@ pub(crate) unsafe fn drag_on(
             if sf.e7 {
                 unsafe { crate::engine7::exchange::exchange(sf, b, &tool, a, c, rk, reach, full, None, 1.0, clip, id, scratch, &mut bounds, lim) };
             } else {
-                unsafe { exchange(sf, b, &tool, a, c, rk, reach, full, None, 1.0, clip, id, scratch, &mut bounds, lim) };
+                unsafe { exchange(&sf, b, &tool, a, c, rk, reach, full, None, 1.0, clip, id, scratch, &mut bounds, lim) };
             }
             b.prev[0] = Some(cur);
         }
@@ -1742,7 +1788,7 @@ fn pickup_fraction(rate: f32, passes: f32) -> f32 {
 /// coats) it would lay on full contact (a touch: film splitting).
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn exchange(
-    sf: Surf,
+    sf: &Surf,
     br: &mut Bristle,
     tool: &Tool,
     a: (f32, f32),
@@ -2036,7 +2082,7 @@ pub(crate) unsafe fn exchange(
                     if take > 0.0 {
                         let tv = take * px_area;
                         got_v += tv;
-                        let picked = sf.pickup_lat(i, take);
+                        let picked = sf.pickup_lat_old(i, take);
                         let l = picked.as_ref().unwrap_or(&*sf.lat.add(i));
                         got_l.add_parts(l, tv);
                         for k in 0..LAT {
@@ -2070,7 +2116,7 @@ pub(crate) unsafe fn exchange(
                     // the hairs of a gathered point lie over each other)
                     let cv = &mut *sf.cover.add(i);
                     *cv = if fine { ((if *sf.vol.add(i) < 1e-6 { 0.0 } else { *cv }) + wt * excl).min(1.0) } else { 1.0 };
-                    sf.lay(i, dep_per_w * wt * takes, blat, bhide, bcure);
+                    sf.lay_old(i, dep_per_w * wt * takes, blat, bhide, bcure);
                     *sf.stroke.add(i) = id;
                 } else if dep_per_w > 0.0 {
                     // a thinned load lays liquid: no more than what is left
@@ -2078,7 +2124,7 @@ pub(crate) unsafe fn exchange(
                     // its hairs (crate::thinner); the rest stays on the hair
                     let mut d = dep_per_w * wt * takes;
                     if let Some((_, from)) = pass_film {
-                        d *= film_lay(&sf, i, from, cap * clip.map_or(1.0, |c| c.at(y * w + x).0), id, d);
+                        d *= film_lay(sf, i, from, cap * clip.map_or(1.0, |c| c.at(y * w + x).0), id, d);
                     } else if capped {
                         let used = if *sf.laid_id.add(i) == id { *sf.laid.add(i) } else { 0.0 };
                         d = d.min((cap - used).max(0.0));
@@ -2088,7 +2134,7 @@ pub(crate) unsafe fn exchange(
                     if d > 0.0 {
                         let cv = &mut *sf.cover.add(i);
                         *cv = if fine { ((if *sf.vol.add(i) < 1e-6 { 0.0 } else { *cv }) + wt * excl).min(1.0) } else { 1.0 };
-                        sf.lay(i, d * (1.0 - phi), blat, bhide, bcure);
+                        sf.lay_old(i, d * (1.0 - phi), blat, bhide, bcure);
                         if !sf.solv.is_null() {
                             *sf.solv.add(i) += d * phi * COAT_UM;
                         }
@@ -2142,7 +2188,7 @@ pub(crate) unsafe fn exchange(
                                 let vi = *sf.vol.add(i);
                                 let ms = if sol > 0.0 && vi > 0.0 { (sol * m / vi).min(sol) } else { 0.0 };
                                 let (m, ms) = if let Some((_, from)) = pass_film.filter(|_| j != i && m > 0.0) {
-                                    let f = film_lay(&sf, j, from, cap * clip.map_or(1.0, |c| c.at(ty * w + tx).0), id, m + ms);
+                                    let f = film_lay(sf, j, from, cap * clip.map_or(1.0, |c| c.at(ty * w + tx).0), id, m + ms);
                                     (m * f, ms * f)
                                 } else if capped && j != i && m > 0.0 {
                                     let used = if *sf.laid_id.add(j) == id { *sf.laid.add(j) } else { 0.0 };
@@ -2168,13 +2214,13 @@ pub(crate) unsafe fn exchange(
                                     // (its film there thins but still covers it)
                                     let cj = &mut *sf.cover.add(j);
                                     *cj = if fine { ((if *sf.vol.add(j) < 1e-6 { 0.0 } else { *cj }) + (m / v.max(1e-9)).min(1.0) * *sf.cover.add(i)).min(1.0) } else { 1.0 };
-                                    let picked = sf.pickup_lat(i, m).or_else(|| sf.layers.then(|| (*sf.lat.add(i)).clone()));
+                                    let picked = sf.pickup_lat_old(i, m).or_else(|| sf.layers.then(|| (*sf.lat.add(i)).clone()));
                                     let hd = sf.take_old(i, m);
                                     // (None only without layers, where nothing in this loop
                                     // writes lat[i] and add writes lat[j], j != i: pixel i's
                                     // latent is still what it was before the plough)
                                     debug_assert!(picked.is_some() || !sf.layers);
-                                    sf.add(j, m, match &picked { Some(p) => p, None => &*sf.lat.add(i) }, hd, cure);
+                                    sf.add_old(j, m, match &picked { Some(p) => p, None => &*sf.lat.add(i) }, hd, cure);
                                 }
                             }
                         }
@@ -2396,7 +2442,7 @@ pub(crate) unsafe fn touch_on(sf: Surf, held: &mut Held, t: &Touch, clip: Option
             if sf.e7 {
                 unsafe { crate::engine7::exchange::exchange(sf, b, &tool, prev, cur, rb, reach, full, Some(v), 1.0, clip, id, scratch, &mut bounds, lim) };
             } else {
-                unsafe { exchange(sf, b, &tool, prev, cur, rb, reach, full, Some(v), 1.0, clip, id, scratch, &mut bounds, lim) };
+                unsafe { exchange(&sf, b, &tool, prev, cur, rb, reach, full, Some(v), 1.0, clip, id, scratch, &mut bounds, lim) };
             }
             b.prev[0] = Some(cur);
         }
