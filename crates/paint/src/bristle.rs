@@ -1974,7 +1974,10 @@ pub(crate) unsafe fn exchange(
         // solvent lifted with the paint, and wet film (paint + solvent) laid
         let mut got_s = 0.0f32;
         let mut laid_liq = 0.0f32;
-        let (blat, bhide, bcure) = (br.lat.clone(), br.hide, br.cure);
+        // (br is not touched until after the pixel loop: lay borrows its
+        // latent rather than a copy)
+        let blat = &br.lat;
+        let (bhide, bcure) = (br.hide, br.cure);
         for y in y0..y1 {
             for x in x0..x1 {
                 let wt = wts[(y - y0) * bw + (x - x0)];
@@ -2039,7 +2042,7 @@ pub(crate) unsafe fn exchange(
                     // the hairs of a gathered point lie over each other)
                     let cv = &mut *sf.cover.add(i);
                     *cv = if fine { ((if *sf.vol.add(i) < 1e-6 { 0.0 } else { *cv }) + wt * excl).min(1.0) } else { 1.0 };
-                    sf.lay(i, dep_per_w * wt * takes, &blat, bhide, bcure);
+                    sf.lay(i, dep_per_w * wt * takes, blat, bhide, bcure);
                     *sf.stroke.add(i) = id;
                 } else if dep_per_w > 0.0 {
                     // a thinned load lays liquid: no more than what is left
@@ -2057,7 +2060,7 @@ pub(crate) unsafe fn exchange(
                     if d > 0.0 {
                         let cv = &mut *sf.cover.add(i);
                         *cv = if fine { ((if *sf.vol.add(i) < 1e-6 { 0.0 } else { *cv }) + wt * excl).min(1.0) } else { 1.0 };
-                        sf.lay(i, d * (1.0 - phi), &blat, bhide, bcure);
+                        sf.lay(i, d * (1.0 - phi), blat, bhide, bcure);
                         if !sf.solv.is_null() {
                             *sf.solv.add(i) += d * phi * COAT_UM;
                         }
@@ -2090,7 +2093,6 @@ pub(crate) unsafe fn exchange(
                             to[0] = (tx, ty, 1.0);
                             1
                         };
-                        let l = (*sf.lat.add(i)).clone();
                         for &(tx, ty, share) in &to[..n_to] {
                             if share <= 0.0 {
                                 continue;
@@ -2140,7 +2142,11 @@ pub(crate) unsafe fn exchange(
                                     *cj = if fine { ((if *sf.vol.add(j) < 1e-6 { 0.0 } else { *cj }) + (m / v.max(1e-9)).min(1.0) * *sf.cover.add(i)).min(1.0) } else { 1.0 };
                                     let picked = sf.pickup_lat(i, m).or_else(|| sf.layers.then(|| (*sf.lat.add(i)).clone()));
                                     let hd = sf.take(i, m);
-                                    sf.add(j, m, picked.as_ref().unwrap_or(&l), hd, cure);
+                                    // (None only without layers, where nothing in this loop
+                                    // writes lat[i] and add writes lat[j], j != i: pixel i's
+                                    // latent is still what it was before the plough)
+                                    debug_assert!(picked.is_some() || !sf.layers);
+                                    sf.add(j, m, match &picked { Some(p) => p, None => &*sf.lat.add(i) }, hd, cure);
                                 }
                             }
                         }
