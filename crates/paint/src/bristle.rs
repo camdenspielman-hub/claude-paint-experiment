@@ -2040,6 +2040,12 @@ pub(crate) unsafe fn exchange(
             2.0 * hair
         };
         let spread = dep.is_none();
+        // where ploughed paint may land: the window, the canvas and the
+        // stroke's footprint. Up to 2^24 these bounds are exact in f32, and
+        // for a target at or past the low ones `(t as usize) < n` is `t < n`
+        let (nx1, ny1) = (w.min(ox + sf.w).min(lim.2), h.min(oy + sf.h).min(lim.3));
+        let exact_bounds = nx1 <= 1 << 24 && ny1 <= 1 << 24;
+        let (bx0, by0, bx1, by1) = (ox.max(lim.0) as f32, oy.max(lim.1) as f32, nx1 as f32, ny1 as f32);
 
         let mut got_v = 0.0f32;
         let mut got_l = Latent::default();
@@ -2172,56 +2178,74 @@ pub(crate) unsafe fn exchange(
                                 continue;
                             }
                             // (paint pushed out of a crop window stays put)
-                            let inside = tx >= ox as f32 && ty >= oy as f32 && (tx as usize) < w.min(ox + sf.w) && (ty as usize) < h.min(oy + sf.h);
-                            debug_assert!(!inside || (tx >= lim.0 as f32 && ty >= lim.1 as f32 && (tx as usize) < lim.2 && (ty as usize) < lim.3), "plough target outside the stroke footprint {lim:?}");
-                            if inside && tx >= lim.0 as f32 && ty >= lim.1 as f32 && (tx as usize) < lim.2 && (ty as usize) < lim.3 {
-                                let (tx, ty) = (tx as usize, ty as usize);
-                                let j = (ty - oy) * bw_buf + tx - ox;
-                                // a clipped stroke can't push paint past its mask:
-                                // only the accepted share moves, the rest stays
-                                let m = m * share * clip.map_or(1.0, |c| c.at(ty * w + tx).0) * sf.takes(j);
-                                // a thinned stroke adds no more wet film to the
-                                // pixel it ploughs into than its ceiling there
-                                // allows; the solvent goes with the paint
-                                // (solvent in µm, as the canvas holds it)
-                                let sol = if sf.solv.is_null() { 0.0 } else { *sf.solv.add(i) / COAT_UM };
-                                let vi = *sf.vol.add(i);
-                                let ms = if sol > 0.0 && vi > 0.0 { (sol * m / vi).min(sol) } else { 0.0 };
-                                let (m, ms) = if let Some((_, from)) = pass_film.filter(|_| j != i && m > 0.0) {
-                                    let f = film_lay(sf, j, from, cap * clip.map_or(1.0, |c| c.at(ty * w + tx).0), id, m + ms);
-                                    (m * f, ms * f)
-                                } else if capped && j != i && m > 0.0 {
-                                    let used = if *sf.laid_id.add(j) == id { *sf.laid.add(j) } else { 0.0 };
-                                    let room = (cap - used).max(0.0);
-                                    let f = if m + ms > room { room / (m + ms) } else { 1.0 };
-                                    *sf.laid_id.add(j) = id;
-                                    *sf.laid.add(j) = used + (m + ms) * f;
-                                    (m * f, ms * f)
-                                } else {
-                                    (m, ms)
-                                };
-                                if j != i && m > 0.0 {
-                                    if ms > 0.0 {
-                                        let si = &mut *sf.solv.add(i);
-                                        let mu = (ms * COAT_UM).min(*si);
-                                        *si -= mu;
-                                        sf.film_give(i, mu / COAT_UM);
-                                        *sf.solv.add(j) += mu;
-                                    }
-                                    let cure = if sf.dry.is_null() { 0.0 } else { (*sf.dry.add(i)).cure };
-                                    // the paint moved covers its share of
-                                    // the pixel it came from
-                                    // (its film there thins but still covers it)
-                                    let cj = &mut *sf.cover.add(j);
-                                    *cj = if fine { ((if *sf.vol.add(j) < 1e-6 { 0.0 } else { *cj }) + (m / v.max(1e-9)).min(1.0) * *sf.cover.add(i)).min(1.0) } else { 1.0 };
-                                    let picked = sf.pickup_lat_old(i, m).or_else(|| sf.layers.then(|| (*sf.lat.add(i)).clone()));
-                                    let hd = sf.take_old(i, m);
-                                    // (None only without layers, where nothing in this loop
-                                    // writes lat[i] and add writes lat[j], j != i: pixel i's
-                                    // latent is still what it was before the plough)
-                                    debug_assert!(picked.is_some() || !sf.layers);
-                                    sf.add_old(j, m, match &picked { Some(p) => p, None => &*sf.lat.add(i) }, hd, cure);
+                            #[cfg(debug_assertions)]
+                            let to_px = {
+                                let inside = tx >= ox as f32 && ty >= oy as f32 && (tx as usize) < w.min(ox + sf.w) && (ty as usize) < h.min(oy + sf.h);
+                                debug_assert!(!inside || (tx >= lim.0 as f32 && ty >= lim.1 as f32 && (tx as usize) < lim.2 && (ty as usize) < lim.3), "plough target outside the stroke footprint {lim:?}");
+                                (inside && tx >= lim.0 as f32 && ty >= lim.1 as f32 && (tx as usize) < lim.2 && (ty as usize) < lim.3).then_some((tx as usize, ty as usize))
+                            };
+                            let (tx, ty) = if exact_bounds {
+                                if !(tx >= bx0 && ty >= by0 && tx < bx1 && ty < by1) {
+                                    #[cfg(debug_assertions)]
+                                    debug_assert_eq!(to_px, None);
+                                    continue;
                                 }
+                                // (0 <= tx, ty < 2^24 here)
+                                (tx.to_int_unchecked::<u32>() as usize, ty.to_int_unchecked::<u32>() as usize)
+                            } else {
+                                let inside = tx >= ox as f32 && ty >= oy as f32 && (tx as usize) < w.min(ox + sf.w) && (ty as usize) < h.min(oy + sf.h);
+                                if !(inside && tx >= lim.0 as f32 && ty >= lim.1 as f32 && (tx as usize) < lim.2 && (ty as usize) < lim.3) {
+                                    continue;
+                                }
+                                (tx as usize, ty as usize)
+                            };
+                            #[cfg(debug_assertions)]
+                            debug_assert_eq!(to_px, Some((tx, ty)));
+                            let j = (ty - oy) * bw_buf + tx - ox;
+                            // a clipped stroke can't push paint past its mask:
+                            // only the accepted share moves, the rest stays
+                            let m = m * share * clip.map_or(1.0, |c| c.at(ty * w + tx).0) * sf.takes(j);
+                            // a thinned stroke adds no more wet film to the
+                            // pixel it ploughs into than its ceiling there
+                            // allows; the solvent goes with the paint
+                            // (solvent in µm, as the canvas holds it)
+                            let sol = if sf.solv.is_null() { 0.0 } else { *sf.solv.add(i) / COAT_UM };
+                            let vi = *sf.vol.add(i);
+                            let ms = if sol > 0.0 && vi > 0.0 { (sol * m / vi).min(sol) } else { 0.0 };
+                            let (m, ms) = if let Some((_, from)) = pass_film.filter(|_| j != i && m > 0.0) {
+                                let f = film_lay(sf, j, from, cap * clip.map_or(1.0, |c| c.at(ty * w + tx).0), id, m + ms);
+                                (m * f, ms * f)
+                            } else if capped && j != i && m > 0.0 {
+                                let used = if *sf.laid_id.add(j) == id { *sf.laid.add(j) } else { 0.0 };
+                                let room = (cap - used).max(0.0);
+                                let f = if m + ms > room { room / (m + ms) } else { 1.0 };
+                                *sf.laid_id.add(j) = id;
+                                *sf.laid.add(j) = used + (m + ms) * f;
+                                (m * f, ms * f)
+                            } else {
+                                (m, ms)
+                            };
+                            if j != i && m > 0.0 {
+                                if ms > 0.0 {
+                                    let si = &mut *sf.solv.add(i);
+                                    let mu = (ms * COAT_UM).min(*si);
+                                    *si -= mu;
+                                    sf.film_give(i, mu / COAT_UM);
+                                    *sf.solv.add(j) += mu;
+                                }
+                                let cure = if sf.dry.is_null() { 0.0 } else { (*sf.dry.add(i)).cure };
+                                // the paint moved covers its share of
+                                // the pixel it came from
+                                // (its film there thins but still covers it)
+                                let cj = &mut *sf.cover.add(j);
+                                *cj = if fine { ((if *sf.vol.add(j) < 1e-6 { 0.0 } else { *cj }) + (m / v.max(1e-9)).min(1.0) * *sf.cover.add(i)).min(1.0) } else { 1.0 };
+                                let picked = sf.pickup_lat_old(i, m).or_else(|| sf.layers.then(|| (*sf.lat.add(i)).clone()));
+                                let hd = sf.take_old(i, m);
+                                // (None only without layers, where nothing in this loop
+                                // writes lat[i] and add writes lat[j], j != i: pixel i's
+                                // latent is still what it was before the plough)
+                                debug_assert!(picked.is_some() || !sf.layers);
+                                sf.add_old(j, m, match &picked { Some(p) => p, None => &*sf.lat.add(i) }, hd, cure);
                             }
                         }
                     }
