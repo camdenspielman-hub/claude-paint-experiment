@@ -151,5 +151,105 @@ pub fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
 pub fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
+
+/// `x.floor()` bit for bit (signed zeros, infinities and NaNs as they
+/// are), without the libm call it is on x86-64 short of SSE4.1.
+#[cfg(all(target_arch = "x86_64", not(target_feature = "sse4.1")))]
+#[inline(always)]
+pub(crate) fn floor_exact(x: f32) -> f32 {
+    // (false for NaN and ±inf; at 2^23 and past it every f32 is whole)
+    if x.abs() < 8_388_608.0 {
+        // (truncation, exact here)
+        let t = unsafe { x.to_int_unchecked::<i32>() } as f32;
+        let f = if t > x { t - 1.0 } else { t };
+        // (floor(-0) is -0, of 0..1 is +0)
+        f.copysign(x)
+    } else {
+        x
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", not(target_feature = "sse4.1"))))]
+#[inline(always)]
+pub(crate) fn floor_exact(x: f32) -> f32 {
+    x.floor()
+}
+
+/// `x.ceil()` bit for bit (see `floor_exact`).
+#[cfg(all(target_arch = "x86_64", not(target_feature = "sse4.1")))]
+#[inline(always)]
+pub(crate) fn ceil_exact(x: f32) -> f32 {
+    -floor_exact(-x)
+}
+
+#[cfg(not(all(target_arch = "x86_64", not(target_feature = "sse4.1"))))]
+#[inline(always)]
+pub(crate) fn ceil_exact(x: f32) -> f32 {
+    x.ceil()
+}
+
+#[cfg(test)]
+mod floor_exact_tests {
+    use super::{ceil_exact, floor_exact};
+
+    fn check(x: f32) {
+        let (f, c) = (floor_exact(x), ceil_exact(x));
+        if x.is_nan() {
+            assert!(f.is_nan() && c.is_nan(), "{:#010x}", x.to_bits());
+        } else {
+            assert_eq!(f.to_bits(), x.floor().to_bits(), "floor {x:e} ({:#010x})", x.to_bits());
+            assert_eq!(c.to_bits(), x.ceil().to_bits(), "ceil {x:e} ({:#010x})", x.to_bits());
+        }
+    }
+
+    #[test]
+    fn floor_and_ceil_match_libm_bit_for_bit() {
+        let two23 = 8_388_608.0f32;
+        let edges = [
+            0.0f32,
+            f32::from_bits(1),
+            f32::from_bits(0x007f_ffff),
+            f32::MIN_POSITIVE,
+            0.5,
+            1.0 - f32::EPSILON / 2.0,
+            1.0,
+            1.0 + f32::EPSILON,
+            1.5,
+            2.5,
+            two23 - 0.5,
+            two23 - 1.0,
+            two23,
+            two23 + 1.0,
+            2147483648.0,
+            4294967296.0,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NAN,
+            f32::from_bits(0x7fa0_0001),
+            f32::from_bits(0x7fc0_1234),
+        ];
+        for x in edges {
+            check(x);
+            check(-x);
+        }
+        for bits in (0..=u32::MAX).step_by(997) {
+            check(f32::from_bits(bits));
+        }
+        for k in -70_000..70_000 {
+            let x = k as f32 * 0.125;
+            check(x);
+            check(f32::from_bits(x.to_bits() + 1));
+            check(f32::from_bits(x.to_bits().wrapping_sub(1)));
+        }
+    }
+
+    #[test]
+    #[ignore = "every f32: about a minute"]
+    fn floor_and_ceil_match_libm_on_every_f32() {
+        for bits in 0..=u32::MAX {
+            check(f32::from_bits(bits));
+        }
+    }
+}
 #[cfg(test)]
 mod tests;

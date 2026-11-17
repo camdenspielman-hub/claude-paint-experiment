@@ -21,7 +21,7 @@ use crate::path::densify;
 use crate::canvas::Canvas;
 use crate::mask::Mask;
 use crate::rng::Rng;
-use crate::smoothstep;
+use crate::{ceil_exact, floor_exact, smoothstep};
 use crate::surface::COAT_UM;
 use crate::wet::{LAT, Latent, Paint, Prop, mix_into};
 
@@ -1811,10 +1811,10 @@ pub(crate) unsafe fn exchange(
         let (ox, oy, bw_buf) = (sf.ox, sf.oy, sf.w);
         let s = sf.scale;
         let px_area = 1.0 / (s * s);
-        let cx0 = ((a.0.min(b.0) - rb - 1.0).floor().max(0.0)) as usize;
-        let cy0 = ((a.1.min(b.1) - rb - 1.0).floor().max(0.0)) as usize;
-        let cx1 = ((a.0.max(b.0) + rb + 1.0).ceil().max(0.0) as usize).min(w);
-        let cy1 = ((a.1.max(b.1) + rb + 1.0).ceil().max(0.0) as usize).min(h);
+        let cx0 = (floor_exact(a.0.min(b.0) - rb - 1.0).max(0.0)) as usize;
+        let cy0 = (floor_exact(a.1.min(b.1) - rb - 1.0).max(0.0)) as usize;
+        let cx1 = (ceil_exact(a.0.max(b.0) + rb + 1.0).max(0.0) as usize).min(w);
+        let cy1 = (ceil_exact(a.1.max(b.1) + rb + 1.0).max(0.0) as usize).min(h);
         if cx1 <= cx0 || cy1 <= cy0 {
             return;
         }
@@ -2165,8 +2165,9 @@ pub(crate) unsafe fn exchange(
                         let mut to = [(0.0f32, 0.0f32, 0.0f32); 4];
                         let n_to = if spread {
                             let (gx, gy) = (tx - 0.5, ty - 0.5);
-                            let (fx, fy) = (gx - gx.floor(), gy - gy.floor());
-                            let (bx, by) = (gx.floor() + 0.5, gy.floor() + 0.5);
+                            let (fgx, fgy) = (floor_exact(gx), floor_exact(gy));
+                            let (fx, fy) = (gx - fgx, gy - fgy);
+                            let (bx, by) = (fgx + 0.5, fgy + 0.5);
                             to = [(bx, by, (1.0 - fx) * (1.0 - fy)), (bx + 1.0, by, fx * (1.0 - fy)), (bx, by + 1.0, (1.0 - fx) * fy), (bx + 1.0, by + 1.0, fx * fy)];
                             4
                         } else {
