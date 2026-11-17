@@ -62,6 +62,72 @@ mod latent_tests {
         assert_eq!(format!("{extended:?}"), format!("{:?}", extended.color));
     }
 
+    /// Every float's bits, every list in order and every buffer's capacity.
+    fn bits(l: &Latent, out: &mut Vec<u64>) {
+        out.extend(l.color.iter().map(|c| c.to_bits() as u64));
+        out.extend([l.parts.len() as u64, l.parts.capacity() as u64, l.layers.len() as u64, l.layers.capacity() as u64]);
+        for p in &l.parts { out.extend([p.0 as u64, p.1.to_bits() as u64]); }
+        for y in &l.layers {
+            out.push(y.share.to_bits() as u64);
+            out.extend(y.hide.iter().map(|h| h.to_bits() as u64));
+            bits(&y.lat, out);
+        }
+    }
+
+    #[test]
+    fn splitting_in_place_matches_split_top() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        let unit = |r: u64| (r >> 40) as f32 / (1u64 << 24) as f32;
+        for case in 0..20000 {
+            let mut px = Latent::default();
+            for _ in 0..1 + next() % 12 {
+                let mut lat = Latent::default();
+                for c in lat.color.iter_mut() { *c = unit(next()); }
+                for _ in 0..next() % 4 {
+                    let id = if next() % 4 == 0 { 64 + next() % 8 } else { next() % 6 } as usize;
+                    lat.parts.push((id, unit(next())));
+                }
+                lat.parts.shrink_to_fit();
+                let share = match next() % 16 {
+                    0 => 0.0, 1 => -0.0, 2 => -0.3, 3 => 1e-40, 4 => f32::INFINITY, 5 => f32::NAN,
+                    _ => unit(next()),
+                };
+                let hide = std::array::from_fn(|_| unit(next()));
+                px.layers.push(Layer { share, lat, hide });
+            }
+            px.layers.reserve(next() as usize % 5);
+            let volume = unit(next()) * 2.0;
+            let hide: Prop = std::array::from_fn(|_| unit(next()));
+            let take = match next() % 8 { 0 => f32::NAN, 1 => f32::INFINITY, 2 => 5.0, 3 => 0.0, _ => unit(next()) };
+            let drain = next() % 2 == 0;
+
+            let (below, top) = px.split_top(volume, hide, take, drain);
+            let (tv, mut tl, th) = Latent::from_layers(top);
+            tl.layers = Vec::new();
+            let (bv, bl, bh) = Latent::from_layers(below);
+            let mut old = vec![tv.to_bits() as u64, bv.to_bits() as u64];
+            old.extend(th.iter().chain(&bh).map(|h| h.to_bits() as u64));
+            bits(&tl, &mut old);
+            bits(&bl, &mut old);
+            let mut peeked = Vec::new();
+            bits(&tl, &mut peeked);
+
+            let mut seen = Vec::new();
+            bits(&px.peek_top(volume, hide, take, drain), &mut seen);
+            assert_eq!(seen, peeked, "case {case}: peek_top");
+            let mut below = px.take_scaled_layers(volume, hide);
+            let (mut tv, mut tl, mut th) = (0.0f32, Latent::default(), [0.0f32; 10]);
+            Latent::split_top_in_place(&mut below, volume, take, drain, &mut tv, &mut tl, &mut th);
+            let (bv, bl, bh) = Latent::from_layers(below);
+            let mut new = vec![tv.to_bits() as u64, bv.to_bits() as u64];
+            new.extend(th.iter().chain(&bh).map(|h| h.to_bits() as u64));
+            bits(&tl, &mut new);
+            bits(&bl, &mut new);
+            assert_eq!(new, old, "case {case}: split_top_in_place");
+        }
+    }
+
     #[cfg(feature = "replay-effects")]
     #[test]
     fn expanded_tuple_deserialization_is_safe_and_rejects_short_input() {
@@ -171,6 +237,91 @@ impl Latent {
         }
         top.reverse();
         (below, top)
+    }
+
+    /// `layers` for a pixel that has them, moved out of it rather than
+    /// cloned: the caller overwrites the latent. The buffers end at the
+    /// capacities a clone would have given them (`Canvas::memory`).
+    pub(crate) fn take_scaled_layers(&mut self, volume: f32, hide: Prop) -> Vec<Layer> {
+        let mut layers = std::mem::take(&mut self.layers);
+        let scatter: f32 = layers.iter().map(|l| l.share * l.hide[0]).sum();
+        let scale = if scatter > 0.0 { hide[0] / scatter } else { 1.0 };
+        let n = layers.len();
+        layers.shrink_to(n);
+        for l in &mut layers {
+            l.share *= volume;
+            l.hide[0] *= scale;
+            if l.lat.parts.capacity() != l.lat.parts.len() { l.lat.parts.shrink_to_fit(); }
+            debug_assert!(l.lat.layers.capacity() == 0);
+        }
+        layers
+    }
+
+    /// `split_top` and `from_layers` of the top in one, in place: mixes the
+    /// top `take` of `layers` (from `layers`, as `split_top`'s `below`)
+    /// into (`tv`, `tl`, `th`) and leaves `layers` as `split_top` leaves
+    /// `below`. The top latent gets no layers. The first pass replays the
+    /// pops (every layer taken whole but the last); the second mixes the
+    /// pieces bottom up, as `from_layers` does after `top.reverse()`.
+    pub(crate) fn split_top_in_place(layers: &mut Vec<Layer>, volume: f32, take: f32, drain: bool, tv: &mut f32, tl: &mut Latent, th: &mut Prop) {
+        let mut left = take.min(volume).max(0.0);
+        let mut c = layers.len();
+        let mut last = 0.0;
+        while left > 0.0 && c > 0 {
+            c -= 1;
+            let amount = left.min(layers[c].share);
+            left -= amount;
+            last = amount;
+        }
+        let mut keep = c;
+        for j in c..layers.len() {
+            let l = &mut layers[j];
+            // (the pops before the last left some to take: each took its
+            // layer whole, `left.min(share)` being the share itself)
+            let amount = if j == c { last } else { l.share };
+            let mut remaining = l.hide;
+            let top_hide = if drain { crate::bristle::take_from(&mut remaining, l.share, amount) } else { l.hide };
+            if amount > 0.0 {
+                mix_into(tv, tl, th, amount, &l.lat, top_hide);
+            }
+            if amount < l.share {
+                l.hide = remaining;
+                l.share -= amount;
+                keep = j + 1;
+            }
+        }
+        layers.truncate(keep);
+    }
+
+    /// `split_top` then `from_layers` of the top, without changing `self`
+    /// (which has layers): the latent the top `take` would mix to, with no
+    /// layers of its own.
+    pub(crate) fn peek_top(&self, volume: f32, hide: Prop, take: f32, drain: bool) -> Latent {
+        let layers = &self.layers;
+        let scatter: f32 = layers.iter().map(|l| l.share * l.hide[0]).sum();
+        let scale = if scatter > 0.0 { hide[0] / scatter } else { 1.0 };
+        let mut left = take.min(volume).max(0.0);
+        let mut c = layers.len();
+        let mut last = 0.0;
+        while left > 0.0 && c > 0 {
+            c -= 1;
+            let amount = left.min(layers[c].share * volume);
+            left -= amount;
+            last = amount;
+        }
+        let (mut tv, mut tl, mut th) = (0.0f32, Self::default(), [0.0f32; 10]);
+        for (j, l) in layers.iter().enumerate().skip(c) {
+            let share = l.share * volume;
+            let amount = if j == c { last } else { share };
+            let mut h = l.hide;
+            h[0] *= scale;
+            let mut remaining = h;
+            let top_hide = if drain { crate::bristle::take_from(&mut remaining, share, amount) } else { h };
+            if amount > 0.0 {
+                mix_into(&mut tv, &mut tl, &mut th, amount, &l.lat, top_hide);
+            }
+        }
+        tl
     }
 
     pub(crate) fn concentrate(&mut self, factor: f32) {
