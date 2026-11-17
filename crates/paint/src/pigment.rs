@@ -30,9 +30,19 @@ pub fn ks_of(r: f32) -> f32 {
 /// scattering `s`: its reflectance over black divided by over white (the
 /// paint industry's contrast ratio). 0 = clear glaze, 1 = hides completely.
 pub fn hiding_of(r: f32, s: f32) -> f32 {
-    let p = Pigment { k: [s * ks_of(r); 3], s: [s; 3] };
-    let b = p.over([0.0; 3], 1.0)[0];
-    let w = p.over([1.0; 3], 1.0)[0];
+    hiding_ks(ks_of(r), s)
+}
+
+/// `hiding_of` given `q = ks_of(r)`. The same operations as
+/// `Pigment::over` on channel 0 of a gray pigment (every channel is that
+/// one), with the unit layer evaluated once for both substrates. Keep the
+/// over formula literal: `t * t * 0.0` is not 0 for an infinite or NaN `t`.
+#[inline]
+fn hiding_ks(q: f32, s: f32) -> f32 {
+    let (r, t) = layer1(s * q, s, 1.0);
+    let (z, o) = (0.0f32, 1.0f32);
+    let b = r + t * t * z / (1.0 - r * z).max(1e-6);
+    let w = r + t * t * o / (1.0 - r * o).max(1e-6);
     (b / w.max(1e-6)).clamp(0.0, 1.0)
 }
 
@@ -40,10 +50,11 @@ pub fn hiding_of(r: f32, s: f32) -> f32 {
 /// (luminance) the contrast ratio `hiding`. Inverse of `hiding_of`.
 pub fn scatter_for(r: f32, hiding: f32) -> f32 {
     let h = hiding.clamp(1e-4, 0.9995);
+    let q = ks_of(r);
     let (mut lo, mut hi) = (-9.0f32, 9.0f32); // ln s
     for _ in 0..40 {
         let mid = 0.5 * (lo + hi);
-        if hiding_of(r, mid.exp()) < h {
+        if hiding_ks(q, mid.exp()) < h {
             lo = mid;
         } else {
             hi = mid;
@@ -184,5 +195,78 @@ impl Pigment {
             out[i] = r[i] + t[i] * t[i] * sub[i] / (1.0 - r[i] * sub[i]).max(1e-6);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `hiding_of` as it was, through `Pigment::over` on all three channels.
+    fn hiding_of_over(r: f32, s: f32) -> f32 {
+        let p = Pigment { k: [s * ks_of(r); 3], s: [s; 3] };
+        let b = p.over([0.0; 3], 1.0)[0];
+        let w = p.over([1.0; 3], 1.0)[0];
+        (b / w.max(1e-6)).clamp(0.0, 1.0)
+    }
+
+    /// The same, given K/S directly, to reach K/S below what `ks_of` returns.
+    fn hiding_q_over(q: f32, s: f32) -> f32 {
+        let p = Pigment { k: [s * q; 3], s: [s; 3] };
+        let b = p.over([0.0; 3], 1.0)[0];
+        let w = p.over([1.0; 3], 1.0)[0];
+        (b / w.max(1e-6)).clamp(0.0, 1.0)
+    }
+
+    /// `scatter_for` as it was, bisecting on `hiding_of_over`.
+    fn scatter_for_over(r: f32, hiding: f32) -> f32 {
+        let h = hiding.clamp(1e-4, 0.9995);
+        let (mut lo, mut hi) = (-9.0f32, 9.0f32);
+        for _ in 0..40 {
+            let mid = 0.5 * (lo + hi);
+            if hiding_of_over(r, mid.exp()) < h {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        (0.5 * (lo + hi)).exp()
+    }
+
+    /// Same bits, or both NaN (NaN sign and payload are not guaranteed).
+    fn same(a: f32, b: f32) -> bool {
+        if a.is_nan() { b.is_nan() } else { a.to_bits() == b.to_bits() }
+    }
+
+    fn grid(lo: f32, hi: f32, n: usize) -> impl Iterator<Item = f32> {
+        (0..=n).map(move |i| lo + (hi - lo) * i as f32 / n as f32)
+    }
+
+    /// The one-layer `hiding_of` and the hoisted `scatter_for` give the bits
+    /// the three-channel `Pigment::over` form gave, on every branch of
+    /// `layer1`: pure absorber, nearly non-absorbing and clamped `bsx`.
+    #[test]
+    fn hiding_of_matches_pigment_over_bit_for_bit() {
+        let mut rs: Vec<f32> = grid(0.0, 1.0, 64).collect();
+        rs.extend([0.002, 0.995, 0.9999, -0.5, 1.5, f32::NAN]);
+        let mut ss: Vec<f32> = (0..=96).map(|i| 1e-6 * 8e9f32.powf(i as f32 / 96.0)).collect();
+        ss.extend([0.0, -0.0, 1e-7, 9.9e-7, 1e-6, 0.16, 8e3, 1e30, f32::INFINITY, f32::NAN]);
+        for &r in &rs {
+            for &s in &ss {
+                assert!(same(hiding_of(r, s), hiding_of_over(r, s)), "hiding_of({r}, {s})");
+            }
+        }
+        for q in [0.0, 1e-9, 1e-8, 1e-7, 4e-7, 1e-6, 1e-4, 1.0, 249.0, f32::INFINITY, f32::NAN] {
+            for &s in &ss {
+                assert!(same(hiding_ks(q, s), hiding_q_over(q, s)), "hiding_ks({q}, {s})");
+            }
+        }
+        let mut hs: Vec<f32> = grid(0.0, 1.0, 40).collect();
+        hs.extend([1e-5, 0.9999, f32::NAN]);
+        for r in rs.iter().copied().step_by(4).chain([0.002, 0.995, f32::NAN]) {
+            for &h in &hs {
+                assert!(same(scatter_for(r, h), scatter_for_over(r, h)), "scatter_for({r}, {h})");
+            }
+        }
     }
 }
