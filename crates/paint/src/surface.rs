@@ -16,6 +16,7 @@
 //! striations.
 
 use crate::canvas::Canvas;
+use crate::floor_exact;
 use crate::rng::hash2;
 use rayon::prelude::*;
 
@@ -654,7 +655,7 @@ const POOL_MAX: f32 = 2.0;
 
 /// Smooth value noise in 0..1 (bilinear with smoothstep), lattice spacing 1.
 pub(crate) fn vnoise(x: f32, y: f32, seed: u64) -> f32 {
-    let (ix, iy) = (x.floor() as i64, y.floor() as i64);
+    let (ix, iy) = (floor_exact(x) as i64, floor_exact(y) as i64);
     let (fx, fy) = (x - ix as f32, y - iy as f32);
     let (sx, sy) = (fx * fx * (3.0 - 2.0 * fx), fy * fy * (3.0 - 2.0 * fy));
     let a = hash2(ix, iy, seed);
@@ -674,7 +675,7 @@ fn linen_um(xm: f32, ym: f32, l: &Linen) -> f32 {
     // threads wander a little; the weft more than the warp
     let u = x0 + 0.25 * (vnoise(x0 * 0.45, y0 * 0.06, seed) - 0.5);
     let v = y0 + 0.5 * l.slubs * (vnoise(x0 * 0.06, y0 * 0.45, seed + 3) - 0.5) + 0.25 * (vnoise(x0 * 0.2, y0 * 0.9, seed + 9) - 0.5);
-    let (iu, iv) = (u.floor() as i64, v.floor() as i64);
+    let (iu, iv) = (floor_exact(u) as i64, floor_exact(v) as i64);
     let (fu, fv) = (u - iu as f32, v - iv as f32);
     // thickness: warp even, weft with slubs (thick spots a few mm long)
     let tw = 0.85 + 0.3 * vnoise(iu as f32 * 0.93, v * 0.3, seed + 11);

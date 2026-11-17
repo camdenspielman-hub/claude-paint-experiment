@@ -395,7 +395,10 @@ fn rebuilding_serves_progress_and_refuses_nonstatus_requests() {
             saw_intermediate |= k > 1 && k < 4;
             previous = k;
         } else {
-            assert_eq!(reply, "ok\n4 chunks · 2400px · no canvas yet\n");
+            // (then the easel's memory, a line of its own)
+            let (head, memory) = reply.split_once("\nmemory: ").unwrap_or((&reply, ""));
+            assert_eq!(head, "ok\n4 chunks · 2400px · no canvas yet", "{reply:?}");
+            assert!(memory.ends_with('\n') && memory.lines().count() == 1, "{reply:?}");
             break;
         }
         std::thread::sleep(Duration::from_millis(20));

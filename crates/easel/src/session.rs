@@ -154,9 +154,12 @@ pub struct Progress {
     /// The chunk's number in the log once it is kept there (0: not yet), while the easel
     /// finishes its reply (a look, a frame).
     kept: AtomicUsize,
+    /// The engine's pass count (`paint::progress`) when the chunk began: a pass with a later
+    /// number is the chunk's own.
+    pass0: AtomicU64,
 }
 
-pub static PROGRESS: Progress = Progress { lines: AtomicUsize::new(0), line: AtomicUsize::new(0), marks0: AtomicU64::new(0), marks: AtomicU64::new(0), clock0: AtomicU64::new(0), clock: AtomicU64::new(0), kept: AtomicUsize::new(0) };
+pub static PROGRESS: Progress = Progress { lines: AtomicUsize::new(0), line: AtomicUsize::new(0), marks0: AtomicU64::new(0), marks: AtomicU64::new(0), clock0: AtomicU64::new(0), clock: AtomicU64::new(0), kept: AtomicUsize::new(0), pass0: AtomicU64::new(0) };
 
 impl Progress {
     fn begin(&self, lines: usize, st: &Studio) {
@@ -167,6 +170,7 @@ impl Progress {
         self.marks.store(marks, Ordering::Relaxed);
         self.clock0.store(st.clock.to_bits(), Ordering::Relaxed);
         self.clock.store(st.clock.to_bits(), Ordering::Relaxed);
+        self.pass0.store(paint::progress::current().map_or(0, |p| p.number), Ordering::Relaxed);
     }
 
     /// Before a chunk is asked for: nothing of the last one's is reported.
@@ -213,8 +217,14 @@ impl Progress {
             return format!("painting a chunk: starting, running for {}", minutes_seconds(elapsed.as_secs_f64()));
         }
         let at = if line > 0 { format!("at line {line} of {lines}") } else { format!("{lines} lines") };
+        // the pass under way (`work`, `stipple`, a brushed ground): how much of it is painted,
+        // and the time left at its rate so far
+        let pass = paint::progress::current().filter(|p| p.number > self.pass0.load(Ordering::Relaxed) && p.total > 0).map_or(String::new(), |p| {
+            let left = p.eta().map_or(String::new(), |eta| if eta.as_secs_f64() < 1.0 { ", nearly done".into() } else { format!(", about {} left", minutes_seconds(eta.as_secs_f64())) });
+            if p.done >= p.total { format!("; its last pass painted all {} of its strokes", p.total) } else { format!("; its current pass has painted {} of {} strokes ({}%){left}", p.done, p.total, p.done * 100 / p.total) }
+        });
         format!(
-            "painting a chunk ({at}): {marks} strokes and touches so far, {} on the painting's clock (now {}), running for {}",
+            "painting a chunk ({at}): {marks} strokes and touches so far, {} on the painting's clock (now {}), running for {}{pass}",
             minutes_seconds(spent), crate::time::time_of_day(clock), minutes_seconds(elapsed.as_secs_f64())
         )
     }
@@ -930,6 +940,12 @@ impl Session {
     pub fn status(&self) -> String {
         let s = self.st.borrow();
         format!("{} chunks · {}px · {}", self.log.len(), s.width, s.setup.as_deref().unwrap_or("no canvas yet"))
+    }
+
+    /// What the canvas holds in memory, buffer by buffer (None: no canvas, or it is resting
+    /// on disk while the sitting's other canvas is used).
+    pub fn memory(&self) -> Option<paint::memory::Memory> {
+        self.canvas().map(|c| c.memory())
     }
 }
 
@@ -2467,7 +2483,7 @@ mod progress {
 
     #[test]
     fn a_kept_chunk_is_reported_as_in_the_log() {
-        let p = Progress { lines: AtomicUsize::new(6), line: AtomicUsize::new(5), marks0: AtomicU64::new(0), marks: AtomicU64::new(0), clock0: AtomicU64::new(0), clock: AtomicU64::new(0), kept: AtomicUsize::new(0) };
+        let p = Progress { lines: AtomicUsize::new(6), line: AtomicUsize::new(5), marks0: AtomicU64::new(0), marks: AtomicU64::new(0), clock0: AtomicU64::new(0), clock: AtomicU64::new(0), kept: AtomicUsize::new(0), pass0: AtomicU64::new(u64::MAX) };
         assert!(p.report(Duration::from_secs(3)).starts_with("painting a chunk (at line 5 of 6)"));
         p.keep(2);
         assert_eq!(p.report(Duration::from_secs(75)), "the chunk is in the log (chunk 2); the easel is finishing its reply, running for 1 min 15 s");

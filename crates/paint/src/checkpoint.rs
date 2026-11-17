@@ -976,6 +976,7 @@ impl Canvas {
                     if !amount.is_finite() || amount < 0.0 || pixel.parts.iter().any(|p| p.0 == i) {
                         return Err(bad("checkpoint pigment list is invalid"));
                     }
+                    pixel.parts.reserve_exact(1);
                     pixel.parts.push((i, amount));
                 }
             }
@@ -1007,8 +1008,10 @@ impl Canvas {
                         let i = usize::try_from(get_u64(r)?).map_err(|_| bad("checkpoint layer pigment is invalid"))?;
                         let amount = get_f32(r)?;
                         if !amount.is_finite() || amount < 0.0 || lat.parts.iter().any(|p| p.0 == i) { return Err(bad("checkpoint layer pigment list is invalid")); }
+                        lat.parts.reserve_exact(1);
                         lat.parts.push((i, amount));
                     }
+                    pixel.layers.reserve_exact(1);
                     pixel.layers.push(crate::wet::Layer { share, lat, hide });
                 }
                 let sum: f32 = pixel.layers.iter().map(|l| l.share).sum();
@@ -1080,23 +1083,32 @@ impl Canvas {
     /// the pixels' latents, pigment lists and skim layers over again; the
     /// written state is dense, mostly zero lanes, and compresses well.
     pub fn pack(&self, w: &mut impl Write) -> io::Result<Aside> {
-        self.write_state(w, "")?;
+        // the per-pixel buffers the state leaves out (or reads back sanitized) go
+        // first, raw, bit for bit: written beside the state, not copied beside the
+        // canvas in memory (a drawing alone is some 80 bytes a pixel)
         let wet = &self.wet;
+        put_raw(w, &wet.floor)?;
+        put_raw(w, &wet.solv)?;
+        put_raw(w, &wet.laid)?;
+        put_raw(w, &wet.laid_id.iter().map(|&v| f32::from_bits(v)).collect::<Vec<_>>())?;
+        put_raw(w, &self.micro)?;
+        put_raw_opt(w, self.receptive.as_deref())?;
+        put_raw_opt(w, (!self.drain).then(|| wet.hide.as_flattened()))?;
+        match &self.drawing {
+            None => put_u64(w, 0)?,
+            Some(d) => {
+                put_u64(w, 1)?;
+                put_drawing(w, d)?;
+            }
+        }
+        self.write_state(w, "")?;
         Ok(Aside {
             absorb_any: self.absorb_any,
             ground_um: self.ground_um,
             hand_slice: self.hand_slice,
             film_pass: self.film_pass,
-            receptive: self.receptive.clone(),
-            floor: wet.floor.clone(),
-            solv: wet.solv.clone(),
-            laid: wet.laid.clone(),
-            laid_id: wet.laid_id.clone(),
-            hide: (!self.drain).then(|| wet.hide.clone()),
-            drawing: self.drawing.clone(),
             soak: self.soak.clone(),
             paper: self.paper,
-            micro: self.micro.clone(),
             sheet: self.sheet.clone(),
         })
     }
@@ -1105,50 +1117,118 @@ impl Canvas {
     /// brushes' contact level is not kept: it is rebuilt from the relief
     /// to the same bits (`engine7::contact_cache`).
     pub fn unpack(r: &mut impl Read, aside: Aside) -> io::Result<Canvas> {
+        let floor = get_raw(r)?;
+        let solv = get_raw(r)?;
+        let laid = get_raw(r)?;
+        let laid_id = get_raw(r)?.into_iter().map(f32::to_bits).collect();
+        let micro = get_raw(r)?;
+        let receptive = get_raw_opt(r)?;
+        let hide = get_raw_opt(r)?.map(|v| v.as_chunks::<10>().0.to_vec());
+        let drawing = match get_u64(r)? {
+            0 => None,
+            _ => Some(Box::new(get_drawing(r)?)),
+        };
         let (mut c, _) = Canvas::read_state(r)?;
         c.absorb_any = aside.absorb_any;
         c.ground_um = aside.ground_um;
         c.hand_slice = aside.hand_slice;
         c.film_pass = aside.film_pass;
-        c.receptive = aside.receptive;
-        c.wet.floor = aside.floor;
-        c.wet.solv = aside.solv;
-        c.wet.laid = aside.laid;
-        c.wet.laid_id = aside.laid_id;
-        if let Some(hide) = aside.hide {
+        c.receptive = receptive;
+        c.wet.floor = floor;
+        c.wet.solv = solv;
+        c.wet.laid = laid;
+        c.wet.laid_id = laid_id;
+        if let Some(hide) = hide {
             c.wet.hide = hide;
         }
-        c.drawing = aside.drawing;
+        c.drawing = drawing;
         c.soak = aside.soak;
         c.paper = aside.paper;
-        c.micro = aside.micro;
+        c.micro = micro;
         c.sheet = aside.sheet;
         Ok(c)
     }
 }
 
-/// What `write_state` leaves out of a canvas, or reads back sanitized,
-/// kept beside the written state by `Canvas::pack`: the film floors and
-/// ceilings only the stroke that set them reads, the solvent buffers as
-/// allocated, the five packing lanes of the paint's properties that only
-/// the drain section writes, the values `read_state` clamps, a pass under
-/// way, and the drawing, cloth, paper and sheet, which are cheap to copy.
+/// What `write_state` leaves out of a canvas, or reads back sanitized, and
+/// `Canvas::pack` keeps in memory beside the written state: the values
+/// `read_state` clamps, a pass under way, and the cloth, paper and sheet,
+/// which are cheap to copy. (The film floors and ceilings only the stroke
+/// that set them reads, the solvent buffers as allocated, the blend's
+/// receptivity, the five packing lanes of the paint's properties that only
+/// the drain section writes, the paper's pores and the drawing are written
+/// raw ahead of the state instead: per pixel, they are not cheap.)
 pub struct Aside {
     absorb_any: bool,
     ground_um: f32,
     hand_slice: Option<f32>,
     film_pass: Option<(f32, u32)>,
-    receptive: Option<Vec<f32>>,
-    floor: Vec<f32>,
-    solv: Vec<f32>,
-    laid: Vec<f32>,
-    laid_id: Vec<u32>,
-    hide: Option<Vec<crate::wet::Prop>>,
-    drawing: Option<Box<crate::graphite::Drawing>>,
     soak: Option<Box<crate::soak::Soak>>,
     paper: Option<crate::paper::Paper>,
-    micro: Vec<f32>,
     sheet: Option<crate::sheet::Sheet>,
+}
+
+/// A buffer of floats, raw (its length, then each value's bits), as `pack` writes it.
+fn put_raw(w: &mut impl Write, v: &[f32]) -> io::Result<()> {
+    put_u64(w, v.len() as u64)?;
+    put_all(w, v.iter().copied())
+}
+
+fn get_raw(r: &mut impl Read) -> io::Result<Vec<f32>> {
+    let n = usize::try_from(get_u64(r)?).map_err(|_| bad("packed canvas buffer is invalid"))?;
+    get_all(r, n)
+}
+
+fn put_raw_opt(w: &mut impl Write, v: Option<&[f32]>) -> io::Result<()> {
+    match v {
+        None => put_u64(w, 0),
+        Some(v) => {
+            put_u64(w, 1)?;
+            put_raw(w, v)
+        }
+    }
+}
+
+fn get_raw_opt(r: &mut impl Read) -> io::Result<Option<Vec<f32>>> {
+    match get_u64(r)? {
+        0 => Ok(None),
+        _ => get_raw(r).map(Some),
+    }
+}
+
+/// A drawing, every field raw, as `pack` writes it (`write_state`'s layouts
+/// leave out what a drawing's kind doesn't read; this keeps all of it).
+fn put_drawing(w: &mut impl Write, d: &crate::graphite::Drawing) -> io::Result<()> {
+    // (destructured whole: a field added to either type fails to compile here until it is kept)
+    let crate::graphite::Drawing { cells, guide, guide_floor, sticks, optics } = d;
+    put_u64(w, u64::from(*sticks) | u64::from(*optics) << 1)?;
+    put_u64(w, cells.len() as u64)?;
+    put_all(w, cells.iter().flat_map(|c| {
+        let crate::graphite::Cell { a, r, lift, floor, film, loose, bound, non_pastel, non_pastel_floor, optics } = *c;
+        let o = optics.unwrap_or_default();
+        let crate::graphite::Optics { fixed, graphite, bound: ob, under } = o;
+        [a, r[0], r[1], r[2], lift, floor, film, loose, bound, non_pastel, non_pastel_floor, if optics.is_some() { 1.0 } else { 0.0 }, fixed, graphite, ob[0], ob[1], ob[2], under[0], under[1], under[2]]
+    }))?;
+    put_raw(w, guide)?;
+    put_raw_opt(w, guide_floor.as_deref())
+}
+
+fn get_drawing(r: &mut impl Read) -> io::Result<crate::graphite::Drawing> {
+    let flags = get_u64(r)?;
+    let n = usize::try_from(get_u64(r)?).map_err(|_| bad("packed drawing is invalid"))?;
+    let cells = get_all(r, n * 20)?.as_chunks::<20>().0.iter().map(|q| crate::graphite::Cell {
+        a: q[0],
+        r: [q[1], q[2], q[3]],
+        lift: q[4],
+        floor: q[5],
+        film: q[6],
+        loose: q[7],
+        bound: q[8],
+        non_pastel: q[9],
+        non_pastel_floor: q[10],
+        optics: (q[11] == 1.0).then(|| crate::graphite::Optics { fixed: q[12], graphite: q[13], bound: [q[14], q[15], q[16]], under: [q[17], q[18], q[19]] }),
+    }).collect();
+    Ok(crate::graphite::Drawing { cells, guide: get_raw(r)?, guide_floor: get_raw_opt(r)?, sticks: flags & 1 != 0, optics: flags & 2 != 0 })
 }
 
 #[cfg(test)]
@@ -1432,6 +1512,67 @@ mod tests {
         let mut bad = Vec::new();
         c.write_state(&mut bad, "").unwrap();
         assert_eq!(Canvas::read_state(&mut Cursor::new(bad)).err().unwrap().kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A canvas packed aside (`Canvas::pack`) and unpacked comes back bit for bit: its state,
+    /// and the buffers the pack writes raw ahead of it (the films' floors and ceilings, the
+    /// solvent, the blend's receptivity, every lane of the paint's properties without the
+    /// drain switch, the paper's pores and the drawing with every field of every cell).
+    #[test]
+    fn a_packed_canvas_unpacks_bit_for_bit() {
+        use crate::graphite::{Lead, Mark};
+        use crate::pastel::{Pose, Stick, StrokePoint};
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let pencil = |c: &mut Canvas| {
+            c.draw(&Lead::graphite(2.0), &Mark { pts: vec![(100.0, 200.0), (500.0, 260.0), (900.0, 220.0)], pressure: vec![0.6, 0.8, 0.5] }, 0.0, 3);
+        };
+        let linen = {
+            let mut c = Canvas::new_window(160, 1.5, [0.6, 0.55, 0.5], None).with_size_mm(80.0).with_engine(5);
+            pencil(&mut c);
+            c.wet.ensure_solvent();
+            // odd values, a negative zero and a NaN with a payload among them, where only the
+            // pack keeps them (the state holds the solvent, and refuses such values there)
+            for (k, v) in c.wet.floor.iter_mut().chain(c.wet.laid.iter_mut()).enumerate() {
+                *v = [0.25, -0.0, f32::from_bits(0x7fc0_1234), 3.5e-7][k % 4];
+            }
+            for (k, v) in c.wet.solv.iter_mut().enumerate() { *v = [0.25, 0.0, 1.5, 3.5e-7][k % 4]; }
+            for (k, v) in c.wet.laid_id.iter_mut().enumerate() { *v = k as u32 * 7; }
+            for (k, h) in c.wet.hide.iter_mut().enumerate() { h[7] = k as f32 * 1e-3; h[9] = 0.125; }
+            c.receptive = Some((0..c.px.len()).map(|k| k as f32 / 97.0).collect());
+            c.hand_slice = Some(2.5);
+            c
+        };
+        let paper = {
+            let mut c = Canvas::new_window(160, 1.5, [0.5; 3], None).with_size_mm(80.0).with_engine(5).with_drawing_optics(true).with_paper(crate::paper::Paper::drawing(2));
+            let mut st = Stick::round([0.7, 0.2, 0.1], 0.8, 12.0);
+            let pose = Pose { force: 2.0, alt: 1.0, az: 0.8, roll: 0.0 };
+            c.stick_stroke(&mut st, &[StrokePoint { x: 100.0, y: 300.0, pose, speed: 60.0 }, StrokePoint { x: 900.0, y: 300.0, pose, speed: 60.0 }]);
+            c.fix_pastel(None, 0.15);
+            pencil(&mut c);
+            c
+        };
+        for c in [linen, paper.with_drain(true)] {
+            assert!(c.drawing.is_some());
+            let mut packed = Vec::new();
+            let aside = c.pack(&mut packed).unwrap();
+            let r = Canvas::unpack(&mut Cursor::new(packed), aside).unwrap();
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            c.write_state(&mut a, "").unwrap();
+            r.write_state(&mut b, "").unwrap();
+            assert!(a == b, "the state differs");
+            assert_eq!(bits(&r.wet.floor), bits(&c.wet.floor));
+            assert_eq!(bits(&r.wet.solv), bits(&c.wet.solv));
+            assert_eq!(bits(&r.wet.laid), bits(&c.wet.laid));
+            assert_eq!(r.wet.laid_id, c.wet.laid_id);
+            assert_eq!(bits(&r.micro), bits(&c.micro));
+            assert_eq!(r.receptive.as_deref().map(bits), c.receptive.as_deref().map(bits));
+            assert_eq!(bits(r.wet.hide.as_flattened()), bits(c.wet.hide.as_flattened()));
+            assert_eq!((r.hand_slice, r.drain, r.paper.is_some()), (c.hand_slice, c.drain, c.paper.is_some()));
+            let (mut da, mut db) = (Vec::new(), Vec::new());
+            put_drawing(&mut da, c.drawing.as_ref().unwrap()).unwrap();
+            put_drawing(&mut db, r.drawing.as_ref().unwrap()).unwrap();
+            assert!(da == db, "the drawing differs");
+        }
     }
 
     /// Pastel dusted off a fixed layer, on a drawing without separate

@@ -129,6 +129,51 @@ fn accumulate(acc: &mut [f32; PACK], p: &[f32; PACK], v: f32) {
     }
 }
 
+/// Whether no tube is listed twice in `parts`.
+fn each_tube_once(parts: &[(usize, f32)]) -> bool {
+    let mut seen = 0u64;
+    parts.iter().enumerate().all(|(k, &(i, _))| {
+        if i >= 64 {
+            return !parts[..k].iter().any(|q| q.0 == i);
+        }
+        let new = seen & 1 << i == 0;
+        seen |= 1 << i;
+        new
+    })
+}
+
+/// `Latent::add_parts(src, w)` into a kernel sum, which lists each tube
+/// once (it starts empty and grows only here): the same sums, and the same
+/// pushes in the same order. An empty sum takes a source that lists each
+/// tube once (`distinct`, worked out at most once per source) as a copy;
+/// otherwise the source's k-th tube is looked for at the sum's k-th entry
+/// before the search.
+#[inline(always)]
+fn gather(dst: &mut Vec<(usize, f32)>, src: &[(usize, f32)], w: f32, distinct: &mut Option<bool>) {
+    if dst.is_empty() && *distinct.get_or_insert_with(|| each_tube_once(src)) {
+        dst.extend(src.iter().map(|&(i, f)| (i, f * w)));
+        return;
+    }
+    for (k, &(i, f)) in src.iter().enumerate() {
+        let at = if dst.get(k).is_some_and(|p| p.0 == i) { Some(k) } else { dst.iter().position(|p| p.0 == i) };
+        match at {
+            Some(j) => dst[j].1 += f * w,
+            None => dst.push((i, f * w)),
+        }
+    }
+}
+
+/// `gather`'s `distinct` for a source: known for the paint a layered pixel
+/// gives (mixed into an empty latent, `Surf::take_with_lat`), to be worked
+/// out for a pixel's own.
+#[inline(always)]
+fn distinct_if_picked(picked: Option<&Latent>) -> Option<bool> {
+    picked.map(|p| {
+        debug_assert!(each_tube_once(&p.parts));
+        true
+    })
+}
+
 /// Engine 7's exchange, with `bristle::exchange`'s arguments (`wts` is only
 /// used by the engine-5 fallback for a contact larger than the window).
 ///
@@ -154,12 +199,12 @@ pub(crate) unsafe fn exchange(
 ) {
     // (the capsule's rectangle is at most |b − a| + 2·rb + 4 pixels a side)
     if ((b.0 - a.0).abs() + 2.0 * rb + 4.0) * ((b.1 - a.1).abs() + 2.0 * rb + 4.0) > window::CAPACITY as f32 {
-        unsafe { crate::bristle::exchange(sf, br, tool, a, b, rb, reach, full, dep, excl, clip, id, wts, bounds, lim) };
+        unsafe { crate::bristle::exchange(&sf, br, tool, a, b, rb, reach, full, dep, excl, clip, id, wts, bounds, lim) };
         return;
     }
     let seg = SegmentInput { sf, bristle: &mut *br, tool, a, b, rb, reach, full, dep, excl, clip, stroke_id: id, limit: lim };
     if window::with(|w| unsafe { contact(seg, bounds, w) }).is_none() {
-        unsafe { crate::bristle::exchange(sf, br, tool, a, b, rb, reach, full, dep, excl, clip, id, wts, bounds, lim) };
+        unsafe { crate::bristle::exchange(&sf, br, tool, a, b, rb, reach, full, dep, excl, clip, id, wts, bounds, lim) };
     }
 }
 
@@ -284,6 +329,18 @@ unsafe fn contact(seg: SegmentInput<'_>, bounds: &mut Bounds, win: &mut Window) 
             }
         }
         let n_to = if spread { 4 } else { 1 };
+        // (the targets no pixel ploughs into, a zero share or the pixel
+        // itself, dropped once for the contact, in order)
+        let mut n_throw = [0usize; 2];
+        for (t, n) in throw.iter_mut().zip(&mut n_throw) {
+            for k in 0..n_to {
+                let (ddx, ddy, sh) = t[k];
+                if !(sh <= 0.0 || (ddx == 0 && ddy == 0)) {
+                    t[*n] = t[k];
+                    *n += 1;
+                }
+            }
+        }
 
         // pass 1: contact weights, into the window's contact list
         let r_out = rb + 0.5;
@@ -391,7 +448,9 @@ unsafe fn contact(seg: SegmentInput<'_>, bounds: &mut Bounds, win: &mut Window) 
         let film = Film::of(sf);
         let laying = Paint7::new(sf.lean, sf.drain, &br.lat, br.hide, br.cure);
         let mut got = [0.0f32; PACK];
-        let mut got_parts = Latent::default();
+        let mut got_parts = std::mem::take(&mut win.got_parts);
+        got_parts.clear();
+        let mut picked_buf = win.picked.take().unwrap_or_default();
         let mut got_s = 0.0f32;
         let mut laid_liq = 0.0f32;
         let mut ploughed = 0.0f32;
@@ -425,9 +484,11 @@ unsafe fn contact(seg: SegmentInput<'_>, bounds: &mut Bounds, win: &mut Window) 
                     }
                     // (the paint lifted: with the drain switch from the top
                     // down, `bristle::take_from`; without, the film's)
-                    let (hp, picked) = sf.take_with_lat(i, tk);
-                    accumulate(&mut got, &packed(sf, i, &hp, cure, picked.as_ref()), tk * px_area);
-                    got_parts.add_parts(picked.as_ref().unwrap_or(&*sf.lat.add(i)), tk * px_area);
+                    let (hp, layered) = sf.take_into(i, tk, &mut picked_buf);
+                    let picked = layered.then_some(&*picked_buf);
+                    accumulate(&mut got, &packed(sf, i, &hp, cure, picked), tk * px_area);
+                    let source = picked.unwrap_or(&*sf.lat.add(i));
+                    gather(&mut got_parts, &source.parts, tk * px_area, &mut distinct_if_picked(picked));
                 }
             }
             if dep_per_w > 0.0 && !capped && phi <= 0.0 {
@@ -466,23 +527,24 @@ unsafe fn contact(seg: SegmentInput<'_>, bounds: &mut Bounds, win: &mut Window) 
                 continue;
             }
             let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-            let to = &throw[((px - a.0) * nx + (py - a.1) * ny < 0.0) as usize][..n_to];
+            let side = ((px - a.0) * nx + (py - a.1) * ny < 0.0) as usize;
+            let to = &throw[side][..n_throw[side]];
             let sol_um = if sf.solv.is_null() { 0.0 } else { *sf.solv.add(i) };
             let cure = if dry { (*sf.dry.add(i)).cure } else { 0.0 };
             let (src_solv, src_cover) = (if sol_um > 0.0 && v > 0.0 { sol_um / v } else { 0.0 }, if fine { *sf.cover.add(i) / v.max(1e-9) } else { 0.0 });
             // where it goes and how much, before any of it leaves (`take`
             // says what paint leaves, so it lands after)
-            let mut moves = [(0usize, 0usize, 0usize, 0.0f32); 4];
+            let mut moves = [(0u32, 0.0f32); 4];
             let mut n_moves = 0;
             let mut out_m = 0.0f32;
             for &(ddx, ddy, sh) in to {
                 let (tx, ty) = (x as isize + ddx, y as isize + ddy);
-                if sh <= 0.0 || (ddx == 0 && ddy == 0) || tx < lx || ty < ly || tx >= hx || ty >= hy {
+                if tx < lx || ty < ly || tx >= hx || ty >= hy {
                     continue;
                 }
                 let (tx, ty) = (tx as usize, ty as usize);
                 let j = (ty - oy) * bw_buf + tx - ox;
-                let c = win.cell(tx, ty, j, || clip.map_or(1.0, |c| c.at(ty * w + tx).0) * sf.takes(j));
+                let (slot, c) = win.cell(tx, ty, j, || clip.map_or(1.0, |c| c.at(ty * w + tx).0) * sf.takes(j));
                 let mut mm = m * sh * c.k;
                 if let Some((_, from)) = pass_film.filter(|_| mm > 0.0) {
                     mm *= crate::bristle::film_lay(&sf, j, from, cap * c.k, id, mm * (1.0 + src_solv / COAT_UM));
@@ -500,7 +562,7 @@ unsafe fn contact(seg: SegmentInput<'_>, bounds: &mut Bounds, win: &mut Window) 
                 if mm <= 0.0 {
                     continue;
                 }
-                moves[n_moves] = (tx, ty, j, mm);
+                moves[n_moves] = (slot, mm);
                 n_moves += 1;
                 out_m += mm;
             }
@@ -517,23 +579,37 @@ unsafe fn contact(seg: SegmentInput<'_>, bounds: &mut Bounds, win: &mut Window) 
                 // cure it had, the cover it brings (fine tools) and its
                 // solvent (µm), in the film's proportions (m ≤ v, so these
                 // never move more than is there)
-                let (hp, picked) = sf.take_with_lat(i, out_m);
-                let mut src = packed(sf, i, &hp, cure, picked.as_ref());
+                let (hp, layered) = sf.take_into(i, out_m, &mut picked_buf);
+                let picked = layered.then_some(&*picked_buf);
+                let mut src = packed(sf, i, &hp, cure, picked);
                 src[COVER] = src_cover;
                 src[SOLV] = src_solv;
-                for &(tx, ty, j, mm) in &moves[..n_moves] {
-                    let cell = win.cell(tx, ty, j, || unreachable!("a plough cell is started before its paint lands"));
-                    accumulate(&mut cell.a, &src, mm);
-                    cell.parts.add_parts(picked.as_ref().unwrap_or(&*sf.lat.add(i)), mm);
+                let source = picked.unwrap_or(&*sf.lat.add(i));
+                let mut distinct = distinct_if_picked(picked);
+                for &(slot, mm) in &moves[..n_moves] {
+                    let cell = win.cell_at(slot);
+                    if cell.fresh {
+                        // (a cell's first paint: the sums of `accumulate`
+                        // into the zeros a cell starts with)
+                        for k in 0..PACK {
+                            cell.a[k] = 0.0 + src[k] * mm;
+                        }
+                        cell.fresh = false;
+                    } else {
+                        accumulate(&mut cell.a, &src, mm);
+                    }
+                    gather(&mut cell.parts, &source.parts, mm, &mut distinct);
                 }
                 ploughed += out_m * px_area;
             }
         }
         win.hits = hits;
         win.weights = weights;
+        win.picked = Some(picked_buf);
         // the ploughed paint lands, one add per destination pixel
-        let mut lat = Latent::default();
-        for c in win.hit_cells() {
+        let (cells, lat) = win.hit_cells();
+        debug_assert!(lat.layers.is_empty());
+        for c in cells {
             let m = c.a[VOL];
             if m <= 0.0 {
                 continue;
@@ -543,11 +619,15 @@ unsafe fn contact(seg: SegmentInput<'_>, bounds: &mut Bounds, win: &mut Window) 
             if !inv.is_finite() {
                 continue;
             }
-            lat.parts.clone_from(&c.parts.parts);
-            lat.scale_parts(inv);
-            for k in 0..LAT {
-                lat[k] = c.a[LAT0 + k] * inv;
+            lat.parts.clear();
+            lat.parts.extend(c.parts.iter().map(|&(i, f)| (i, f * inv)));
+            // (scaled in a copy of its own, which the compiler vectorizes:
+            // it can't tell `lat` from the cell)
+            let mut color: [f32; LAT] = c.a[LAT0..LAT0 + LAT].try_into().unwrap();
+            for x in &mut color {
+                *x *= inv;
             }
+            lat.color = color;
             let mut hide: Prop = [0.0; 10];
             for k in 0..hide.len() {
                 hide[k] = c.a[HIDE0 + k] * inv;
@@ -557,7 +637,7 @@ unsafe fn contact(seg: SegmentInput<'_>, bounds: &mut Bounds, win: &mut Window) 
             }
             let cj = &mut *sf.cover.add(j);
             *cj = if fine { ((if *sf.vol.add(j) < 1e-6 { 0.0 } else { *cj }) + c.a[COVER]).min(1.0) } else { 1.0 };
-            film.add(j, m, &Paint7::new(sf.lean, sf.drain, &lat, hide, c.a[CURE] * inv));
+            film.add(j, m, &Paint7::new(sf.lean, sf.drain, lat, hide, c.a[CURE] * inv));
         }
         let had = br.vol + br.solvent;
         if phi > 0.0 || pass_film.is_some() {
@@ -571,9 +651,11 @@ unsafe fn contact(seg: SegmentInput<'_>, bounds: &mut Bounds, win: &mut Window) 
         br.solvent += got_s;
         let got_v = got[VOL];
         if got_v > 0.0 {
-            let mut got_l: Latent = Latent::default();
-            got_l.parts = got_parts.parts;
-            got_l.scale_parts(1.0 / got_v);
+            let got_l = &mut win.got_l;
+            debug_assert!(got_l.layers.is_empty());
+            let r = 1.0 / got_v;
+            got_l.parts.clear();
+            got_l.parts.extend(got_parts.iter().map(|&(i, f)| (i, f * r)));
             for k in 0..LAT {
                 got_l[k] = got[LAT0 + k] / got_v;
             }
@@ -582,8 +664,9 @@ unsafe fn contact(seg: SegmentInput<'_>, bounds: &mut Bounds, win: &mut Window) 
                 got_h[k] = got[HIDE0 + k] / got_v;
             }
             br.cure = mix_cure(br.cure, br.vol, got[CURE] / got_v, got_v);
-            mix_into(&mut br.vol, &mut br.lat, &mut br.hide, got_v, &got_l, got_h);
+            mix_into(&mut br.vol, &mut br.lat, &mut br.hide, got_v, got_l, got_h);
         }
+        win.got_parts = got_parts;
         let pad = (off + 2.0) as usize;
         grow(bounds, x0.saturating_sub(pad).max(ox), y0.saturating_sub(pad).max(oy), (x1 + pad).min(ox + sf.w), (y1 + pad).min(oy + sf.h));
         Some(AcceptedTransfer { picked: got_v + got_s, laid, outside: ploughed })

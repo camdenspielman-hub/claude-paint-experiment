@@ -21,7 +21,7 @@ use crate::path::densify;
 use crate::canvas::Canvas;
 use crate::mask::Mask;
 use crate::rng::Rng;
-use crate::smoothstep;
+use crate::{ceil_exact, floor_exact, smoothstep};
 use crate::surface::COAT_UM;
 use crate::wet::{LAT, Latent, Paint, Prop, mix_into};
 
@@ -860,6 +860,12 @@ impl Surf {
     /// bristle feels the film as it now is, not as it was at the last wait.
     #[inline]
     pub(crate) unsafe fn add(&self, i: usize, v: f32, lat: &Latent, hide: Prop, cure: f32) {
+        unsafe { self.add_old(i, v, lat, hide, cure) }
+    }
+
+    /// `add`, inlined into the old kernel's pixel loop (`exchange`).
+    #[inline(always)]
+    pub(crate) unsafe fn add_old(&self, i: usize, v: f32, lat: &Latent, hide: Prop, cure: f32) {
         unsafe {
             if v <= 0.0 {
                 return;
@@ -904,7 +910,12 @@ impl Surf {
             if !self.absorb.is_null() {
                 let scatter = hd[0];
                 *vol = if self.drain { ground_drain(&mut *self.absorb.add(i), t, hd) } else { ground_draw(&mut *self.absorb.add(i), v, t, hd) };
-                if self.volume_latent && scatter > 0.0 { l.concentrate(hd[0] / scatter); }
+                if self.volume_latent && scatter > 0.0 {
+                    // (by exactly 1, a no-op: every lane and part was just
+                    // mixed, so none is a signalling NaN, and no layers)
+                    let f = hd[0] / scatter;
+                    if f != 1.0 { l.concentrate(f); }
+                }
             }
         }
     }
@@ -935,17 +946,53 @@ impl Surf {
         }
     }
 
+    /// `lay`, for the old kernel (`exchange`): its guards inline, the
+    /// skimming body out of line (brush skim is engine 7 on, where the old
+    /// kernel is only the fallback).
+    #[inline(always)]
+    pub(crate) unsafe fn lay_old(&self, i: usize, v: f32, lat: &Latent, hide: Prop, cure: f32) {
+        if self.drain && v <= 0.0 {
+            return;
+        }
+        if self.skim <= 0.0 {
+            return unsafe { self.add_old(i, v, lat, hide, cure) };
+        }
+        unsafe { self.lay_skimmed(i, v, lat, hide, cure) }
+    }
+
+    /// (`lay` past its guards, which it checks again to the same effect)
+    #[cold]
+    #[inline(never)]
+    unsafe fn lay_skimmed(&self, i: usize, v: f32, lat: &Latent, hide: Prop, cure: f32) {
+        unsafe { self.lay(i, v, lat, hide, cure) }
+    }
+
     pub(crate) unsafe fn lay_layers(&self, i: usize, v: f32, lat: &Latent, hide: Prop, cure: f32, skim: f32) {
         if v <= 0.0 { return; }
         unsafe {
-            let (mut below, top) = (*self.lat.add(i)).split_top(*self.vol.add(i), *self.hide.add(i), skim, self.drain);
-            let (volume, pigment, properties) = Latent::from_layers(top);
-            *self.vol.add(i) = volume;
-            *self.lat.add(i) = pigment;
-            *self.hide.add(i) = properties;
+            // (the pixel's paint is moved into the split, not cloned: the
+            // pixel is written over before anything reads it again)
+            let (volume, px) = (*self.vol.add(i), &mut *self.lat.add(i));
+            let mut below = if px.layers.is_empty() {
+                let mut whole = std::mem::take(px);
+                whole.layers = Vec::new();
+                if whole.parts.capacity() != whole.parts.len() { whole.parts.shrink_to_fit(); }
+                let mut below = Vec::with_capacity(1);
+                below.push(crate::wet::Layer { share: volume, lat: whole, hide: *self.hide.add(i) });
+                below
+            } else {
+                px.take_scaled_layers(volume, *self.hide.add(i))
+            };
+            let (mut tv, mut tl, mut th) = (0.0f32, Latent::default(), [0.0f32; 10]);
+            Latent::split_top_in_place(&mut below, volume, skim, self.drain, &mut tv, &mut tl, &mut th);
+            *self.vol.add(i) = tv;
+            *self.lat.add(i) = tl;
+            *self.hide.add(i) = th;
+            // (`add` mixes, so the top's layers are gone before anything reads them)
             self.add(i, v, lat, hide, cure);
-            let mut pigment = (*self.lat.add(i)).clone();
-            pigment.layers.clear();
+            let mut pigment = std::mem::take(&mut *self.lat.add(i));
+            pigment.layers = Vec::new();
+            if pigment.parts.capacity() != pigment.parts.len() { pigment.parts.shrink_to_fit(); }
             below.push(crate::wet::Layer { share: *self.vol.add(i), lat: pigment, hide: *self.hide.add(i) });
             let (volume, pigment, properties) = Latent::from_layers(below);
             *self.vol.add(i) = volume;
@@ -957,11 +1004,27 @@ impl Surf {
     pub(crate) unsafe fn pickup_lat(&self, i: usize, v: f32) -> Option<Latent> {
         unsafe {
             if !self.layers || (*self.lat.add(i)).layers.is_empty() { return None; }
-            let (_, top) = (*self.lat.add(i)).split_top(*self.vol.add(i), *self.hide.add(i), v, self.drain);
-            let (_, mut lat, _) = Latent::from_layers(top);
-            lat.layers = Vec::new();
-            Some(lat)
+            Some((*self.lat.add(i)).peek_top(*self.vol.add(i), *self.hide.add(i), v, self.drain))
         }
+    }
+
+    /// `pickup_lat`, for the old kernel (`exchange`): a pixel without
+    /// layers gives None inline.
+    #[inline(always)]
+    pub(crate) unsafe fn pickup_lat_old(&self, i: usize, v: f32) -> Option<Latent> {
+        unsafe {
+            if !self.layers || (*self.lat.add(i)).layers.is_empty() {
+                return None;
+            }
+            self.pickup_lat_layered(i, v)
+        }
+    }
+
+    /// (`pickup_lat` past its guard, which it checks again to the same effect)
+    #[cold]
+    #[inline(never)]
+    unsafe fn pickup_lat_layered(&self, i: usize, v: f32) -> Option<Latent> {
+        unsafe { self.pickup_lat(i, v) }
     }
 
     /// The share (0..1) of what a bristle lays or ploughs that pixel `i`
@@ -980,21 +1043,42 @@ impl Surf {
         unsafe { self.take_with_lat(i, v).0 }
     }
 
+    /// `take`, for the old kernel (`exchange`): a pixel without layers is
+    /// taken inline (`take_with_lat`'s own steps, in its order), one with
+    /// layers out of line.
+    #[inline(always)]
+    pub(crate) unsafe fn take_old(&self, i: usize, v: f32) -> Prop {
+        unsafe {
+            // (`film_give` touches only the film ceiling: testing the layers
+            // first leaves it the same, and `take_with_lat` runs it itself)
+            if self.layers && !(*self.lat.add(i)).layers.is_empty() {
+                return self.take_layered(i, v);
+            }
+            self.film_give(i, v);
+            let vol = &mut *self.vol.add(i);
+            let got = if self.drain { take_from(&mut *self.hide.add(i), *vol, v) } else { *self.hide.add(i) };
+            *vol -= v;
+            if self.cure_now && *vol < 1e-5 && !self.dry.is_null() {
+                (*self.dry.add(i)).cure = 0.0;
+            }
+            got
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn take_layered(&self, i: usize, v: f32) -> Prop {
+        unsafe { self.take_with_lat(i, v).0 }
+    }
+
     #[inline]
     pub(crate) unsafe fn take_with_lat(&self, i: usize, v: f32) -> (Prop, Option<Latent>) {
         unsafe {
             self.film_give(i, v);
             let vol = &mut *self.vol.add(i);
             if self.layers && !(*self.lat.add(i)).layers.is_empty() {
-                let (below, top) = (*self.lat.add(i)).split_top(*vol, *self.hide.add(i), v, self.drain);
-                let (_, mut picked, got) = Latent::from_layers(top);
-                picked.layers = Vec::new();
-                let (left, lat, hide) = Latent::from_layers(below);
-                *vol = left;
-                *self.lat.add(i) = lat;
-                *self.hide.add(i) = hide;
-                if self.cure_now && *vol < 1e-5 && !self.dry.is_null() { (*self.dry.add(i)).cure = 0.0; }
-                return (if self.drain { fluid_of(got) } else { got }, Some(picked));
+                let mut picked = Latent::default();
+                return (self.take_layers(i, v, &mut picked), Some(picked));
             }
             let got = if self.drain { take_from(&mut *self.hide.add(i), *vol, v) } else { *self.hide.add(i) };
             *vol -= v;
@@ -1002,6 +1086,41 @@ impl Surf {
                 (*self.dry.add(i)).cure = 0.0;
             }
             (got, None)
+        }
+    }
+
+    /// `take_with_lat` into a scratch latent: the paint a layered pixel
+    /// gives is mixed into `picked` (set to `Latent::default()`'s paint
+    /// first) and the flag is true; a pixel without layers leaves `picked`
+    /// as it was.
+    #[inline]
+    pub(crate) unsafe fn take_into(&self, i: usize, v: f32, picked: &mut Latent) -> (Prop, bool) {
+        unsafe {
+            if self.layers && !(*self.lat.add(i)).layers.is_empty() {
+                self.film_give(i, v);
+                debug_assert!(picked.layers.is_empty());
+                picked.color = [0.0; LAT];
+                picked.parts.clear();
+                return (self.take_layers(i, v, picked), true);
+            }
+            (self.take(i, v), false)
+        }
+    }
+
+    /// `take_with_lat` of a layered pixel, after `film_give`: the top `v`
+    /// of its layers is mixed into `picked`, which holds no paint.
+    unsafe fn take_layers(&self, i: usize, v: f32, picked: &mut Latent) -> Prop {
+        unsafe {
+            let vol = &mut *self.vol.add(i);
+            let mut below = (*self.lat.add(i)).take_scaled_layers(*vol, *self.hide.add(i));
+            let (mut taken, mut got) = (0.0f32, [0.0f32; 10]);
+            Latent::split_top_in_place(&mut below, *vol, v, self.drain, &mut taken, picked, &mut got);
+            let (left, lat, hide) = Latent::from_layers(below);
+            *vol = left;
+            *self.lat.add(i) = lat;
+            *self.hide.add(i) = hide;
+            if self.cure_now && *vol < 1e-5 && !self.dry.is_null() { (*self.dry.add(i)).cure = 0.0; }
+            if self.drain { fluid_of(got) } else { got }
         }
     }
 
@@ -1534,7 +1653,7 @@ pub(crate) unsafe fn drag_on(
             if sf.e7 {
                 unsafe { crate::engine7::exchange::exchange(sf, b, &tool, a, c, rk, reach, full, None, 1.0, clip, id, scratch, &mut bounds, lim) };
             } else {
-                unsafe { exchange(sf, b, &tool, a, c, rk, reach, full, None, 1.0, clip, id, scratch, &mut bounds, lim) };
+                unsafe { exchange(&sf, b, &tool, a, c, rk, reach, full, None, 1.0, clip, id, scratch, &mut bounds, lim) };
             }
             b.prev[0] = Some(cur);
         }
@@ -1669,7 +1788,7 @@ fn pickup_fraction(rate: f32, passes: f32) -> f32 {
 /// coats) it would lay on full contact (a touch: film splitting).
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn exchange(
-    sf: Surf,
+    sf: &Surf,
     br: &mut Bristle,
     tool: &Tool,
     a: (f32, f32),
@@ -1692,10 +1811,10 @@ pub(crate) unsafe fn exchange(
         let (ox, oy, bw_buf) = (sf.ox, sf.oy, sf.w);
         let s = sf.scale;
         let px_area = 1.0 / (s * s);
-        let cx0 = ((a.0.min(b.0) - rb - 1.0).floor().max(0.0)) as usize;
-        let cy0 = ((a.1.min(b.1) - rb - 1.0).floor().max(0.0)) as usize;
-        let cx1 = ((a.0.max(b.0) + rb + 1.0).ceil().max(0.0) as usize).min(w);
-        let cy1 = ((a.1.max(b.1) + rb + 1.0).ceil().max(0.0) as usize).min(h);
+        let cx0 = (floor_exact(a.0.min(b.0) - rb - 1.0).max(0.0)) as usize;
+        let cy0 = (floor_exact(a.1.min(b.1) - rb - 1.0).max(0.0)) as usize;
+        let cx1 = (ceil_exact(a.0.max(b.0) + rb + 1.0).max(0.0) as usize).min(w);
+        let cy1 = (ceil_exact(a.1.max(b.1) + rb + 1.0).max(0.0) as usize).min(h);
         if cx1 <= cx0 || cy1 <= cy0 {
             return;
         }
@@ -1921,6 +2040,12 @@ pub(crate) unsafe fn exchange(
             2.0 * hair
         };
         let spread = dep.is_none();
+        // where ploughed paint may land: the window, the canvas and the
+        // stroke's footprint. Up to 2^24 these bounds are exact in f32, and
+        // for a target at or past the low ones `(t as usize) < n` is `t < n`
+        let (nx1, ny1) = (w.min(ox + sf.w).min(lim.2), h.min(oy + sf.h).min(lim.3));
+        let exact_bounds = nx1 <= 1 << 24 && ny1 <= 1 << 24;
+        let (bx0, by0, bx1, by1) = (ox.max(lim.0) as f32, oy.max(lim.1) as f32, nx1 as f32, ny1 as f32);
 
         let mut got_v = 0.0f32;
         let mut got_l = Latent::default();
@@ -1929,7 +2054,10 @@ pub(crate) unsafe fn exchange(
         // solvent lifted with the paint, and wet film (paint + solvent) laid
         let mut got_s = 0.0f32;
         let mut laid_liq = 0.0f32;
-        let (blat, bhide, bcure) = (br.lat.clone(), br.hide, br.cure);
+        // (br is not touched until after the pixel loop: lay borrows its
+        // latent rather than a copy)
+        let blat = &br.lat;
+        let (bhide, bcure) = (br.hide, br.cure);
         for y in y0..y1 {
             for x in x0..x1 {
                 let wt = wts[(y - y0) * bw + (x - x0)];
@@ -1960,7 +2088,7 @@ pub(crate) unsafe fn exchange(
                     if take > 0.0 {
                         let tv = take * px_area;
                         got_v += tv;
-                        let picked = sf.pickup_lat(i, take);
+                        let picked = sf.pickup_lat_old(i, take);
                         let l = picked.as_ref().unwrap_or(&*sf.lat.add(i));
                         got_l.add_parts(l, tv);
                         for k in 0..LAT {
@@ -1981,7 +2109,7 @@ pub(crate) unsafe fn exchange(
                                 got_s += ts / COAT_UM * px_area;
                             }
                         }
-                        let hp = sf.take(i, take);
+                        let hp = sf.take_old(i, take);
                         for k in 0..hp.len() {
                             got_h[k] += hp[k] * tv;
                         }
@@ -1994,7 +2122,7 @@ pub(crate) unsafe fn exchange(
                     // the hairs of a gathered point lie over each other)
                     let cv = &mut *sf.cover.add(i);
                     *cv = if fine { ((if *sf.vol.add(i) < 1e-6 { 0.0 } else { *cv }) + wt * excl).min(1.0) } else { 1.0 };
-                    sf.lay(i, dep_per_w * wt * takes, &blat, bhide, bcure);
+                    sf.lay_old(i, dep_per_w * wt * takes, blat, bhide, bcure);
                     *sf.stroke.add(i) = id;
                 } else if dep_per_w > 0.0 {
                     // a thinned load lays liquid: no more than what is left
@@ -2002,7 +2130,7 @@ pub(crate) unsafe fn exchange(
                     // its hairs (crate::thinner); the rest stays on the hair
                     let mut d = dep_per_w * wt * takes;
                     if let Some((_, from)) = pass_film {
-                        d *= film_lay(&sf, i, from, cap * clip.map_or(1.0, |c| c.at(y * w + x).0), id, d);
+                        d *= film_lay(sf, i, from, cap * clip.map_or(1.0, |c| c.at(y * w + x).0), id, d);
                     } else if capped {
                         let used = if *sf.laid_id.add(i) == id { *sf.laid.add(i) } else { 0.0 };
                         d = d.min((cap - used).max(0.0));
@@ -2012,7 +2140,7 @@ pub(crate) unsafe fn exchange(
                     if d > 0.0 {
                         let cv = &mut *sf.cover.add(i);
                         *cv = if fine { ((if *sf.vol.add(i) < 1e-6 { 0.0 } else { *cv }) + wt * excl).min(1.0) } else { 1.0 };
-                        sf.lay(i, d * (1.0 - phi), &blat, bhide, bcure);
+                        sf.lay_old(i, d * (1.0 - phi), blat, bhide, bcure);
                         if !sf.solv.is_null() {
                             *sf.solv.add(i) += d * phi * COAT_UM;
                         }
@@ -2037,66 +2165,88 @@ pub(crate) unsafe fn exchange(
                         let mut to = [(0.0f32, 0.0f32, 0.0f32); 4];
                         let n_to = if spread {
                             let (gx, gy) = (tx - 0.5, ty - 0.5);
-                            let (fx, fy) = (gx - gx.floor(), gy - gy.floor());
-                            let (bx, by) = (gx.floor() + 0.5, gy.floor() + 0.5);
+                            let (fgx, fgy) = (floor_exact(gx), floor_exact(gy));
+                            let (fx, fy) = (gx - fgx, gy - fgy);
+                            let (bx, by) = (fgx + 0.5, fgy + 0.5);
                             to = [(bx, by, (1.0 - fx) * (1.0 - fy)), (bx + 1.0, by, fx * (1.0 - fy)), (bx, by + 1.0, (1.0 - fx) * fy), (bx + 1.0, by + 1.0, fx * fy)];
                             4
                         } else {
                             to[0] = (tx, ty, 1.0);
                             1
                         };
-                        let l = (*sf.lat.add(i)).clone();
                         for &(tx, ty, share) in &to[..n_to] {
                             if share <= 0.0 {
                                 continue;
                             }
                             // (paint pushed out of a crop window stays put)
-                            let inside = tx >= ox as f32 && ty >= oy as f32 && (tx as usize) < w.min(ox + sf.w) && (ty as usize) < h.min(oy + sf.h);
-                            debug_assert!(!inside || (tx >= lim.0 as f32 && ty >= lim.1 as f32 && (tx as usize) < lim.2 && (ty as usize) < lim.3), "plough target outside the stroke footprint {lim:?}");
-                            if inside && tx >= lim.0 as f32 && ty >= lim.1 as f32 && (tx as usize) < lim.2 && (ty as usize) < lim.3 {
-                                let (tx, ty) = (tx as usize, ty as usize);
-                                let j = (ty - oy) * bw_buf + tx - ox;
-                                // a clipped stroke can't push paint past its mask:
-                                // only the accepted share moves, the rest stays
-                                let m = m * share * clip.map_or(1.0, |c| c.at(ty * w + tx).0) * sf.takes(j);
-                                // a thinned stroke adds no more wet film to the
-                                // pixel it ploughs into than its ceiling there
-                                // allows; the solvent goes with the paint
-                                // (solvent in µm, as the canvas holds it)
-                                let sol = if sf.solv.is_null() { 0.0 } else { *sf.solv.add(i) / COAT_UM };
-                                let vi = *sf.vol.add(i);
-                                let ms = if sol > 0.0 && vi > 0.0 { (sol * m / vi).min(sol) } else { 0.0 };
-                                let (m, ms) = if let Some((_, from)) = pass_film.filter(|_| j != i && m > 0.0) {
-                                    let f = film_lay(&sf, j, from, cap * clip.map_or(1.0, |c| c.at(ty * w + tx).0), id, m + ms);
-                                    (m * f, ms * f)
-                                } else if capped && j != i && m > 0.0 {
-                                    let used = if *sf.laid_id.add(j) == id { *sf.laid.add(j) } else { 0.0 };
-                                    let room = (cap - used).max(0.0);
-                                    let f = if m + ms > room { room / (m + ms) } else { 1.0 };
-                                    *sf.laid_id.add(j) = id;
-                                    *sf.laid.add(j) = used + (m + ms) * f;
-                                    (m * f, ms * f)
-                                } else {
-                                    (m, ms)
-                                };
-                                if j != i && m > 0.0 {
-                                    if ms > 0.0 {
-                                        let si = &mut *sf.solv.add(i);
-                                        let mu = (ms * COAT_UM).min(*si);
-                                        *si -= mu;
-                                        sf.film_give(i, mu / COAT_UM);
-                                        *sf.solv.add(j) += mu;
-                                    }
-                                    let cure = if sf.dry.is_null() { 0.0 } else { (*sf.dry.add(i)).cure };
-                                    // the paint moved covers its share of
-                                    // the pixel it came from
-                                    // (its film there thins but still covers it)
-                                    let cj = &mut *sf.cover.add(j);
-                                    *cj = if fine { ((if *sf.vol.add(j) < 1e-6 { 0.0 } else { *cj }) + (m / v.max(1e-9)).min(1.0) * *sf.cover.add(i)).min(1.0) } else { 1.0 };
-                                    let picked = sf.pickup_lat(i, m).or_else(|| sf.layers.then(|| (*sf.lat.add(i)).clone()));
-                                    let hd = sf.take(i, m);
-                                    sf.add(j, m, picked.as_ref().unwrap_or(&l), hd, cure);
+                            #[cfg(debug_assertions)]
+                            let to_px = {
+                                let inside = tx >= ox as f32 && ty >= oy as f32 && (tx as usize) < w.min(ox + sf.w) && (ty as usize) < h.min(oy + sf.h);
+                                debug_assert!(!inside || (tx >= lim.0 as f32 && ty >= lim.1 as f32 && (tx as usize) < lim.2 && (ty as usize) < lim.3), "plough target outside the stroke footprint {lim:?}");
+                                (inside && tx >= lim.0 as f32 && ty >= lim.1 as f32 && (tx as usize) < lim.2 && (ty as usize) < lim.3).then_some((tx as usize, ty as usize))
+                            };
+                            let (tx, ty) = if exact_bounds {
+                                if !(tx >= bx0 && ty >= by0 && tx < bx1 && ty < by1) {
+                                    #[cfg(debug_assertions)]
+                                    debug_assert_eq!(to_px, None);
+                                    continue;
                                 }
+                                // (0 <= tx, ty < 2^24 here)
+                                (tx.to_int_unchecked::<u32>() as usize, ty.to_int_unchecked::<u32>() as usize)
+                            } else {
+                                let inside = tx >= ox as f32 && ty >= oy as f32 && (tx as usize) < w.min(ox + sf.w) && (ty as usize) < h.min(oy + sf.h);
+                                if !(inside && tx >= lim.0 as f32 && ty >= lim.1 as f32 && (tx as usize) < lim.2 && (ty as usize) < lim.3) {
+                                    continue;
+                                }
+                                (tx as usize, ty as usize)
+                            };
+                            #[cfg(debug_assertions)]
+                            debug_assert_eq!(to_px, Some((tx, ty)));
+                            let j = (ty - oy) * bw_buf + tx - ox;
+                            // a clipped stroke can't push paint past its mask:
+                            // only the accepted share moves, the rest stays
+                            let m = m * share * clip.map_or(1.0, |c| c.at(ty * w + tx).0) * sf.takes(j);
+                            // a thinned stroke adds no more wet film to the
+                            // pixel it ploughs into than its ceiling there
+                            // allows; the solvent goes with the paint
+                            // (solvent in µm, as the canvas holds it)
+                            let sol = if sf.solv.is_null() { 0.0 } else { *sf.solv.add(i) / COAT_UM };
+                            let vi = *sf.vol.add(i);
+                            let ms = if sol > 0.0 && vi > 0.0 { (sol * m / vi).min(sol) } else { 0.0 };
+                            let (m, ms) = if let Some((_, from)) = pass_film.filter(|_| j != i && m > 0.0) {
+                                let f = film_lay(sf, j, from, cap * clip.map_or(1.0, |c| c.at(ty * w + tx).0), id, m + ms);
+                                (m * f, ms * f)
+                            } else if capped && j != i && m > 0.0 {
+                                let used = if *sf.laid_id.add(j) == id { *sf.laid.add(j) } else { 0.0 };
+                                let room = (cap - used).max(0.0);
+                                let f = if m + ms > room { room / (m + ms) } else { 1.0 };
+                                *sf.laid_id.add(j) = id;
+                                *sf.laid.add(j) = used + (m + ms) * f;
+                                (m * f, ms * f)
+                            } else {
+                                (m, ms)
+                            };
+                            if j != i && m > 0.0 {
+                                if ms > 0.0 {
+                                    let si = &mut *sf.solv.add(i);
+                                    let mu = (ms * COAT_UM).min(*si);
+                                    *si -= mu;
+                                    sf.film_give(i, mu / COAT_UM);
+                                    *sf.solv.add(j) += mu;
+                                }
+                                let cure = if sf.dry.is_null() { 0.0 } else { (*sf.dry.add(i)).cure };
+                                // the paint moved covers its share of
+                                // the pixel it came from
+                                // (its film there thins but still covers it)
+                                let cj = &mut *sf.cover.add(j);
+                                *cj = if fine { ((if *sf.vol.add(j) < 1e-6 { 0.0 } else { *cj }) + (m / v.max(1e-9)).min(1.0) * *sf.cover.add(i)).min(1.0) } else { 1.0 };
+                                let picked = sf.pickup_lat_old(i, m).or_else(|| sf.layers.then(|| (*sf.lat.add(i)).clone()));
+                                let hd = sf.take_old(i, m);
+                                // (None only without layers, where nothing in this loop
+                                // writes lat[i] and add writes lat[j], j != i: pixel i's
+                                // latent is still what it was before the plough)
+                                debug_assert!(picked.is_some() || !sf.layers);
+                                sf.add_old(j, m, match &picked { Some(p) => p, None => &*sf.lat.add(i) }, hd, cure);
                             }
                         }
                     }
@@ -2317,7 +2467,7 @@ pub(crate) unsafe fn touch_on(sf: Surf, held: &mut Held, t: &Touch, clip: Option
             if sf.e7 {
                 unsafe { crate::engine7::exchange::exchange(sf, b, &tool, prev, cur, rb, reach, full, Some(v), 1.0, clip, id, scratch, &mut bounds, lim) };
             } else {
-                unsafe { exchange(sf, b, &tool, prev, cur, rb, reach, full, Some(v), 1.0, clip, id, scratch, &mut bounds, lim) };
+                unsafe { exchange(&sf, b, &tool, prev, cur, rb, reach, full, Some(v), 1.0, clip, id, scratch, &mut bounds, lim) };
             }
             b.prev[0] = Some(cur);
         }

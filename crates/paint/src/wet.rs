@@ -62,6 +62,132 @@ mod latent_tests {
         assert_eq!(format!("{extended:?}"), format!("{:?}", extended.color));
     }
 
+    /// Every float's bits, every list in order and every buffer's capacity.
+    fn bits(l: &Latent, out: &mut Vec<u64>) {
+        out.extend(l.color.iter().map(|c| c.to_bits() as u64));
+        out.extend([l.parts.len() as u64, l.parts.capacity() as u64, l.layers.len() as u64, l.layers.capacity() as u64]);
+        for p in &l.parts { out.extend([p.0 as u64, p.1.to_bits() as u64]); }
+        for y in &l.layers {
+            out.push(y.share.to_bits() as u64);
+            out.extend(y.hide.iter().map(|h| h.to_bits() as u64));
+            bits(&y.lat, out);
+        }
+    }
+
+    #[test]
+    fn splitting_in_place_matches_split_top() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        let unit = |r: u64| (r >> 40) as f32 / (1u64 << 24) as f32;
+        for case in 0..20000 {
+            let mut px = Latent::default();
+            for _ in 0..1 + next() % 12 {
+                let mut lat = Latent::default();
+                for c in lat.color.iter_mut() { *c = unit(next()); }
+                for _ in 0..next() % 4 {
+                    let id = if next() % 4 == 0 { 64 + next() % 8 } else { next() % 6 } as usize;
+                    lat.parts.push((id, unit(next())));
+                }
+                lat.parts.shrink_to_fit();
+                let share = match next() % 16 {
+                    0 => 0.0, 1 => -0.0, 2 => -0.3, 3 => 1e-40, 4 => f32::INFINITY, 5 => f32::NAN,
+                    _ => unit(next()),
+                };
+                let hide = std::array::from_fn(|_| unit(next()));
+                px.layers.push(Layer { share, lat, hide });
+            }
+            px.layers.reserve(next() as usize % 5);
+            let volume = unit(next()) * 2.0;
+            let hide: Prop = std::array::from_fn(|_| unit(next()));
+            let take = match next() % 8 { 0 => f32::NAN, 1 => f32::INFINITY, 2 => 5.0, 3 => 0.0, _ => unit(next()) };
+            let drain = next() % 2 == 0;
+
+            let (below, top) = px.split_top(volume, hide, take, drain);
+            let (tv, mut tl, th) = Latent::from_layers(top);
+            tl.layers = Vec::new();
+            let (bv, bl, bh) = Latent::from_layers(below);
+            let mut old = vec![tv.to_bits() as u64, bv.to_bits() as u64];
+            old.extend(th.iter().chain(&bh).map(|h| h.to_bits() as u64));
+            bits(&tl, &mut old);
+            bits(&bl, &mut old);
+            let mut peeked = Vec::new();
+            bits(&tl, &mut peeked);
+
+            let mut seen = Vec::new();
+            bits(&px.peek_top(volume, hide, take, drain), &mut seen);
+            assert_eq!(seen, peeked, "case {case}: peek_top");
+            let mut below = px.take_scaled_layers(volume, hide);
+            let (mut tv, mut tl, mut th) = (0.0f32, Latent::default(), [0.0f32; 10]);
+            Latent::split_top_in_place(&mut below, volume, take, drain, &mut tv, &mut tl, &mut th);
+            let (bv, bl, bh) = Latent::from_layers(below);
+            let mut new = vec![tv.to_bits() as u64, bv.to_bits() as u64];
+            new.extend(th.iter().chain(&bh).map(|h| h.to_bits() as u64));
+            bits(&tl, &mut new);
+            bits(&bl, &mut new);
+            assert_eq!(new, old, "case {case}: split_top_in_place");
+        }
+    }
+
+    #[test]
+    fn indexed_parts_match_the_search() {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        let unit = |r: u64| (r >> 40) as f32 / (1u64 << 24) as f32;
+        let amount = |next: &mut dyn FnMut() -> u64, nan: bool| match next() % 16 {
+            0 => 0.0, 1 => -0.0, 2 if nan => f32::NAN, 3 if nan => f32::from_bits(0x7f80_0001), 4 => 1e-40, 5 => f32::INFINITY, 6 => -0.5,
+            _ => unit(next()),
+        };
+        let list = |next: &mut dyn FnMut() -> u64, nan: bool| {
+            let mut lat = Latent::default();
+            let len = if next() % 50 == 0 { 100 + next() % 160 } else { next() % 20 };
+            let span = [4, 9, 16, 70, 300][next() as usize % 5];
+            for _ in 0..len {
+                let id = if next() % 10 == 0 { 62 + next() % 4 } else { next() % span } as usize;
+                lat.parts.push((id, amount(next, nan)));
+            }
+            if next() % 2 == 0 { lat.parts.shrink_to_fit(); }
+            if next() % 3 == 0 { lat.layers.reserve(1); }
+            lat
+        };
+        // (where two NaNs meet, which one's payload a sum keeps is the
+        // compiler's choice of operand order: with NaN inputs only whether
+        // each amount is NaN is compared)
+        let same = |a: &Latent, b: &Latent, nan: bool| {
+            let key = |l: &Latent| {
+                let amounts = l.parts.iter().map(|p| if nan && p.1.is_nan() { (p.0, 0x7fc0_0000) } else { (p.0, p.1.to_bits()) });
+                (l.parts.len(), l.parts.capacity(), l.layers.len(), l.layers.capacity(), amounts.collect::<Vec<_>>())
+            };
+            key(a) == key(b)
+        };
+        for case in 0..200000 {
+            let nan = case % 8 == 0;
+            let a = if case % 4 == 1 { Latent::default() } else { list(&mut next, nan) };
+            let b = if case % 4 == 2 {
+                // the same tubes in the same order, now and then one apart
+                let mut b = Latent::default();
+                for p in &a.parts { b.parts.push((p.0, amount(&mut next, nan))); }
+                if !b.parts.is_empty() && next() % 4 == 0 { let k = next() as usize % b.parts.len(); b.parts[k].0 = next() as usize % 70; }
+                b
+            } else {
+                list(&mut next, nan)
+            };
+            let w = match next() % 10 { 0 => 0.0, 1 => 1.0, 2 if nan => f32::NAN, 3 => -0.0, 4 => 2.0, _ => unit(next()) };
+            let (mut old, mut new) = (a.clone(), a.clone());
+            old.add_parts_by_search(&b, w);
+            new.add_parts(&b, w);
+            assert!(same(&new, &old, nan), "case {case}: add_parts");
+            let (mut old, mut new) = (a.clone(), a.clone());
+            old.layers = Vec::new();
+            if !(old.parts.is_empty() && b.parts.is_empty()) {
+                old.scale_parts(1.0 - w);
+                old.add_parts_by_search(&b, w);
+                old.parts.retain(|p| p.1 > 0.0);
+            }
+            new.blend_parts(&b, w);
+            assert!(same(&new, &old, nan), "case {case}: blend_parts");
+        }
+    }
+
     #[cfg(feature = "replay-effects")]
     #[test]
     fn expanded_tuple_deserialization_is_safe_and_rejects_short_input() {
@@ -119,6 +245,19 @@ impl std::ops::DerefMut for Latent {
     fn deref_mut(&mut self) -> &mut Self::Target { &mut self.color }
 }
 
+/// Whether `parts` names each tube once, every one of them below 64.
+#[inline]
+fn distinct_tubes(parts: &[(usize, f32)]) -> bool {
+    let mut seen = 0u64;
+    for &(i, _) in parts {
+        if i >= 64 || seen & 1 << i != 0 {
+            return false;
+        }
+        seen |= 1 << i;
+    }
+    true
+}
+
 impl Latent {
     pub fn from_color(color: [f32; LAT]) -> Self { Self { color, parts: Vec::new(), layers: Vec::new() } }
 
@@ -173,6 +312,91 @@ impl Latent {
         (below, top)
     }
 
+    /// `layers` for a pixel that has them, moved out of it rather than
+    /// cloned: the caller overwrites the latent. The buffers end at the
+    /// capacities a clone would have given them (`Canvas::memory`).
+    pub(crate) fn take_scaled_layers(&mut self, volume: f32, hide: Prop) -> Vec<Layer> {
+        let mut layers = std::mem::take(&mut self.layers);
+        let scatter: f32 = layers.iter().map(|l| l.share * l.hide[0]).sum();
+        let scale = if scatter > 0.0 { hide[0] / scatter } else { 1.0 };
+        let n = layers.len();
+        layers.shrink_to(n);
+        for l in &mut layers {
+            l.share *= volume;
+            l.hide[0] *= scale;
+            if l.lat.parts.capacity() != l.lat.parts.len() { l.lat.parts.shrink_to_fit(); }
+            debug_assert!(l.lat.layers.capacity() == 0);
+        }
+        layers
+    }
+
+    /// `split_top` and `from_layers` of the top in one, in place: mixes the
+    /// top `take` of `layers` (from `layers`, as `split_top`'s `below`)
+    /// into (`tv`, `tl`, `th`) and leaves `layers` as `split_top` leaves
+    /// `below`. The top latent gets no layers. The first pass replays the
+    /// pops (every layer taken whole but the last); the second mixes the
+    /// pieces bottom up, as `from_layers` does after `top.reverse()`.
+    pub(crate) fn split_top_in_place(layers: &mut Vec<Layer>, volume: f32, take: f32, drain: bool, tv: &mut f32, tl: &mut Latent, th: &mut Prop) {
+        let mut left = take.min(volume).max(0.0);
+        let mut c = layers.len();
+        let mut last = 0.0;
+        while left > 0.0 && c > 0 {
+            c -= 1;
+            let amount = left.min(layers[c].share);
+            left -= amount;
+            last = amount;
+        }
+        let mut keep = c;
+        for j in c..layers.len() {
+            let l = &mut layers[j];
+            // (the pops before the last left some to take: each took its
+            // layer whole, `left.min(share)` being the share itself)
+            let amount = if j == c { last } else { l.share };
+            let mut remaining = l.hide;
+            let top_hide = if drain { crate::bristle::take_from(&mut remaining, l.share, amount) } else { l.hide };
+            if amount > 0.0 {
+                mix_into(tv, tl, th, amount, &l.lat, top_hide);
+            }
+            if amount < l.share {
+                l.hide = remaining;
+                l.share -= amount;
+                keep = j + 1;
+            }
+        }
+        layers.truncate(keep);
+    }
+
+    /// `split_top` then `from_layers` of the top, without changing `self`
+    /// (which has layers): the latent the top `take` would mix to, with no
+    /// layers of its own.
+    pub(crate) fn peek_top(&self, volume: f32, hide: Prop, take: f32, drain: bool) -> Latent {
+        let layers = &self.layers;
+        let scatter: f32 = layers.iter().map(|l| l.share * l.hide[0]).sum();
+        let scale = if scatter > 0.0 { hide[0] / scatter } else { 1.0 };
+        let mut left = take.min(volume).max(0.0);
+        let mut c = layers.len();
+        let mut last = 0.0;
+        while left > 0.0 && c > 0 {
+            c -= 1;
+            let amount = left.min(layers[c].share * volume);
+            left -= amount;
+            last = amount;
+        }
+        let (mut tv, mut tl, mut th) = (0.0f32, Self::default(), [0.0f32; 10]);
+        for (j, l) in layers.iter().enumerate().skip(c) {
+            let share = l.share * volume;
+            let amount = if j == c { last } else { share };
+            let mut h = l.hide;
+            h[0] *= scale;
+            let mut remaining = h;
+            let top_hide = if drain { crate::bristle::take_from(&mut remaining, share, amount) } else { h };
+            if amount > 0.0 {
+                mix_into(&mut tv, &mut tl, &mut th, amount, &l.lat, top_hide);
+            }
+        }
+        tl
+    }
+
     pub(crate) fn concentrate(&mut self, factor: f32) {
         for c in &mut self.color { *c *= factor; }
         self.scale_parts(factor);
@@ -182,11 +406,93 @@ impl Latent {
         }
     }
 
+    #[inline]
     pub(crate) fn add_parts(&mut self, other: &Self, weight: f32) {
-        for &(i, f) in &other.parts {
+        if other.parts.is_empty() { return; }
+        self.add_parts_lists(other, weight);
+    }
+
+    #[inline(never)]
+    fn add_parts_lists(&mut self, other: &Self, weight: f32) {
+        self.add_parts_scaled::<false>(other, weight, 1.0);
+    }
+
+    /// `add_parts`, with `SCALE` the entries already there scaled by `s`
+    /// first (`scale_parts`). Each tube's entry is the first holding it
+    /// (what `add_parts_by_search` finds), and the list grows as it does
+    /// there. Most of a painting's mixes are into an empty list, or of two
+    /// lists naming the same tubes in the same order. Otherwise a table of
+    /// each tube's first index stands in for the search (tubes from 64 on
+    /// are still searched for); the smallest lists and those too long for a
+    /// byte index go by search.
+    #[inline]
+    fn add_parts_scaled<const SCALE: bool>(&mut self, other: &Self, weight: f32, s: f32) {
+        let (n0, m) = (self.parts.len(), other.parts.len());
+        if m == 0 {
+            if SCALE { self.scale_parts(s); }
+            return;
+        }
+        if n0 == 0 && distinct_tubes(&other.parts) {
+            // (every tube is new: the list grows once, by all of them)
+            self.parts.reserve_exact(m);
+            for &(i, f) in &other.parts {
+                self.parts.push((i, f * weight));
+            }
+            return;
+        }
+        if n0 == m && self.parts.iter().zip(&other.parts).all(|(p, o)| p.0 == o.0) && distinct_tubes(&self.parts) {
+            // (each tube's entry is the one at its own index)
+            if SCALE { self.scale_parts(s); }
+            for (p, &(_, f)) in self.parts.iter_mut().zip(&other.parts) {
+                p.1 += f * weight;
+            }
+            return;
+        }
+        if n0 * m <= 4 || n0 + m > 254 {
+            if SCALE { self.scale_parts(s); }
+            return self.add_parts_by_search(other, weight);
+        }
+        const NONE: u8 = u8::MAX;
+        let mut first = [NONE; 64];
+        // (backwards, so a tube listed twice keeps its first index)
+        for k in (0..n0).rev() {
+            let p = &mut self.parts[k];
+            if SCALE { p.1 *= s; }
+            if p.0 < 64 { first[p.0] = k as u8; }
+        }
+        let mut grown = false;
+        for (k, &(i, f)) in other.parts.iter().enumerate() {
+            let at = if i < 64 { first[i] } else { self.parts.iter().position(|p| p.0 == i).map_or(NONE, |at| at as u8) };
+            if at != NONE {
+                self.parts[at as usize].1 += f * weight;
+            } else {
+                if !grown {
+                    let more = other.parts[k..].iter().filter(|o| if o.0 < 64 { first[o.0] == NONE } else { !self.parts.iter().any(|p| p.0 == o.0) }).count();
+                    self.parts.reserve_exact(more);
+                    grown = true;
+                }
+                if i < 64 { first[i] = self.parts.len() as u8; }
+                self.parts.push((i, f * weight));
+            }
+        }
+    }
+
+    fn add_parts_by_search(&mut self, other: &Self, weight: f32) {
+        let mut grown = false;
+        for (k, &(i, f)) in other.parts.iter().enumerate() {
             match self.parts.iter_mut().find(|p| p.0 == i) {
                 Some(p) => p.1 += f * weight,
-                None => self.parts.push((i, f * weight)),
+                None => {
+                    // (the list grows once, by exactly the tubes this mix brings, not by
+                    // doubling: every pixel of a canvas keeps a list, and doubling left a
+                    // third of their room unused)
+                    if !grown {
+                        let more = other.parts[k..].iter().filter(|o| !self.parts.iter().any(|p| p.0 == o.0)).count();
+                        self.parts.reserve_exact(more);
+                        grown = true;
+                    }
+                    self.parts.push((i, f * weight))
+                }
             }
         }
     }
@@ -195,11 +501,17 @@ impl Latent {
         for p in &mut self.parts { p.1 *= weight; }
     }
 
+    #[inline]
     pub(crate) fn blend_parts(&mut self, other: &Self, weight: f32) {
-        self.layers = Vec::new();
+        // (a list that never held a buffer has nothing to free)
+        if self.layers.capacity() != 0 { self.layers = Vec::new(); }
         if self.parts.is_empty() && other.parts.is_empty() { return; }
-        self.scale_parts(1.0 - weight);
-        self.add_parts(other, weight);
+        self.blend_parts_lists(other, weight);
+    }
+
+    #[inline(never)]
+    fn blend_parts_lists(&mut self, other: &Self, weight: f32) {
+        self.add_parts_scaled::<true>(other, weight, 1.0 - weight);
         self.parts.retain(|p| p.1 > 0.0);
     }
 }

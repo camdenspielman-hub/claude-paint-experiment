@@ -144,7 +144,11 @@ impl Film {
             let (cap, hd) = (&mut *self.absorb.add(i), &mut *self.hide.add(i));
             let scatter = hd[0];
             *vol = if self.drain { ground_drain(cap, t, hd) } else { ground_draw(cap, v, t, hd) };
-            if self.surf.volume_latent && scatter > 0.0 { (*self.lat.add(i)).concentrate(hd[0] / scatter); }
+            if self.surf.volume_latent && scatter > 0.0 {
+                // (by exactly 1 a no-op, as in `Surf::add`)
+                let f = hd[0] / scatter;
+                if f != 1.0 { (*self.lat.add(i)).concentrate(f); }
+            }
         }
     }
 }
