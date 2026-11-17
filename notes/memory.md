@@ -98,11 +98,9 @@ other). A knife or roller ground takes seconds, and a ground in the cache
 
 ## Not changed, and why
 
-- **The physics kernel's time.** Most of a pass is `bristle::exchange` and
-  `Surf::add`/`take` (a callgrind profile of a brushed ground: 94% inside
-  `exchange`). Making it faster without changing a single float is a careful
-  project of its own; the brushed ground in particular runs one stroke after
-  another by design.
+- **The physics kernel's time.** Done since, bit for bit: see
+  `notes/simulation-speed.md` (20 to 45% fewer instructions). The brushed
+  ground still runs one stroke after another, by design.
 - **The per-pixel layout.** The 48-lane latent (192 bytes) and the 38-band
   backing (176) are most of a pixel. A sparse layout would cut them for
   pixels without wet paint, but every pixel's stale latent still shapes the
