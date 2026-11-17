@@ -41,13 +41,15 @@ pub(crate) struct Hit {
 }
 
 /// Paint ploughed into one interior pixel during one contact: its buffer
-/// index, the clip's acceptance there (read once) and the packed sum.
+/// index, the clip's acceptance there (read once) and the packed sum. A
+/// fresh cell has had no paint yet: of its sum only the volume (0) holds.
 #[derive(Clone)]
 pub(crate) struct Acc {
     /// The tubes' sums, each tube listed once (`exchange::gather`).
     pub parts: Vec<(usize, f32)>,
     pub j: usize,
     pub k: f32,
+    pub fresh: bool,
     pub a: [f32; PACK],
 }
 
@@ -91,16 +93,16 @@ impl Window {
         self.used.clear();
         let n = interior.2.saturating_sub(interior.0) * interior.3.saturating_sub(interior.1);
         if self.cells.len() < n {
-            self.cells.resize(n, Acc { parts: Vec::new(), j: 0, k: 0.0, a: [0.0; PACK] });
+            self.cells.resize(n, Acc { parts: Vec::new(), j: 0, k: 0.0, fresh: false, a: [0.0; PACK] });
             self.stamp.resize(n, 0);
         }
     }
 
-    /// The plough cell of interior pixel (`x`, `y`). Met for the first
-    /// time this contact, it starts empty at buffer index `j`, with the
-    /// acceptance `k()` gives.
+    /// The plough cell of interior pixel (`x`, `y`), and its slot
+    /// (`cell_at`). Met for the first time this contact, it starts empty at
+    /// buffer index `j`, with the acceptance `k()` gives.
     #[inline]
-    pub(crate) fn cell(&mut self, x: usize, y: usize, j: usize, k: impl FnOnce() -> f32) -> &mut Acc {
+    pub(crate) fn cell(&mut self, x: usize, y: usize, j: usize, k: impl FnOnce() -> f32) -> (u32, &mut Acc) {
         let r = self.interior;
         debug_assert!(x >= r.0 && y >= r.1 && x < r.2 && y < r.3, "plough cell ({x}, {y}) outside the interior {r:?}");
         let c = (y - r.1) * (r.2 - r.0) + (x - r.0);
@@ -110,10 +112,17 @@ impl Window {
             cell.parts.clear();
             cell.j = j;
             cell.k = k();
-            cell.a.fill(0.0);
+            cell.fresh = true;
+            cell.a[VOL] = 0.0;
             self.used.push(c as u32);
         }
-        &mut self.cells[c]
+        (c as u32, &mut self.cells[c])
+    }
+
+    /// The cell in `slot`, which `cell` started this contact.
+    #[inline]
+    pub(crate) fn cell_at(&mut self, slot: u32) -> &mut Acc {
+        &mut self.cells[slot as usize]
     }
 
     /// The cells hit this contact, in first-hit order, and the scratch

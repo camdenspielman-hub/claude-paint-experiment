@@ -329,6 +329,18 @@ unsafe fn contact(seg: SegmentInput<'_>, bounds: &mut Bounds, win: &mut Window) 
             }
         }
         let n_to = if spread { 4 } else { 1 };
+        // (the targets no pixel ploughs into, a zero share or the pixel
+        // itself, dropped once for the contact, in order)
+        let mut n_throw = [0usize; 2];
+        for (t, n) in throw.iter_mut().zip(&mut n_throw) {
+            for k in 0..n_to {
+                let (ddx, ddy, sh) = t[k];
+                if !(sh <= 0.0 || (ddx == 0 && ddy == 0)) {
+                    t[*n] = t[k];
+                    *n += 1;
+                }
+            }
+        }
 
         // pass 1: contact weights, into the window's contact list
         let r_out = rb + 0.5;
@@ -515,23 +527,24 @@ unsafe fn contact(seg: SegmentInput<'_>, bounds: &mut Bounds, win: &mut Window) 
                 continue;
             }
             let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-            let to = &throw[((px - a.0) * nx + (py - a.1) * ny < 0.0) as usize][..n_to];
+            let side = ((px - a.0) * nx + (py - a.1) * ny < 0.0) as usize;
+            let to = &throw[side][..n_throw[side]];
             let sol_um = if sf.solv.is_null() { 0.0 } else { *sf.solv.add(i) };
             let cure = if dry { (*sf.dry.add(i)).cure } else { 0.0 };
             let (src_solv, src_cover) = (if sol_um > 0.0 && v > 0.0 { sol_um / v } else { 0.0 }, if fine { *sf.cover.add(i) / v.max(1e-9) } else { 0.0 });
             // where it goes and how much, before any of it leaves (`take`
             // says what paint leaves, so it lands after)
-            let mut moves = [(0usize, 0usize, 0usize, 0.0f32); 4];
+            let mut moves = [(0u32, 0.0f32); 4];
             let mut n_moves = 0;
             let mut out_m = 0.0f32;
             for &(ddx, ddy, sh) in to {
                 let (tx, ty) = (x as isize + ddx, y as isize + ddy);
-                if sh <= 0.0 || (ddx == 0 && ddy == 0) || tx < lx || ty < ly || tx >= hx || ty >= hy {
+                if tx < lx || ty < ly || tx >= hx || ty >= hy {
                     continue;
                 }
                 let (tx, ty) = (tx as usize, ty as usize);
                 let j = (ty - oy) * bw_buf + tx - ox;
-                let c = win.cell(tx, ty, j, || clip.map_or(1.0, |c| c.at(ty * w + tx).0) * sf.takes(j));
+                let (slot, c) = win.cell(tx, ty, j, || clip.map_or(1.0, |c| c.at(ty * w + tx).0) * sf.takes(j));
                 let mut mm = m * sh * c.k;
                 if let Some((_, from)) = pass_film.filter(|_| mm > 0.0) {
                     mm *= crate::bristle::film_lay(&sf, j, from, cap * c.k, id, mm * (1.0 + src_solv / COAT_UM));
@@ -549,7 +562,7 @@ unsafe fn contact(seg: SegmentInput<'_>, bounds: &mut Bounds, win: &mut Window) 
                 if mm <= 0.0 {
                     continue;
                 }
-                moves[n_moves] = (tx, ty, j, mm);
+                moves[n_moves] = (slot, mm);
                 n_moves += 1;
                 out_m += mm;
             }
@@ -573,9 +586,18 @@ unsafe fn contact(seg: SegmentInput<'_>, bounds: &mut Bounds, win: &mut Window) 
                 src[SOLV] = src_solv;
                 let source = picked.unwrap_or(&*sf.lat.add(i));
                 let mut distinct = distinct_if_picked(picked);
-                for &(tx, ty, j, mm) in &moves[..n_moves] {
-                    let cell = win.cell(tx, ty, j, || unreachable!("a plough cell is started before its paint lands"));
-                    accumulate(&mut cell.a, &src, mm);
+                for &(slot, mm) in &moves[..n_moves] {
+                    let cell = win.cell_at(slot);
+                    if cell.fresh {
+                        // (a cell's first paint: the sums of `accumulate`
+                        // into the zeros a cell starts with)
+                        for k in 0..PACK {
+                            cell.a[k] = 0.0 + src[k] * mm;
+                        }
+                        cell.fresh = false;
+                    } else {
+                        accumulate(&mut cell.a, &src, mm);
+                    }
                     gather(&mut cell.parts, &source.parts, mm, &mut distinct);
                 }
                 ploughed += out_m * px_area;
