@@ -997,6 +997,34 @@ impl Surf {
         unsafe { self.take_with_lat(i, v).0 }
     }
 
+    /// `take`, for the old kernel (`exchange`): a pixel without layers is
+    /// taken inline (`take_with_lat`'s own steps, in its order), one with
+    /// layers out of line.
+    #[inline(always)]
+    pub(crate) unsafe fn take_old(&self, i: usize, v: f32) -> Prop {
+        unsafe {
+            // (`film_give` touches only the film ceiling: testing the layers
+            // first leaves it the same, and `take_with_lat` runs it itself)
+            if self.layers && !(*self.lat.add(i)).layers.is_empty() {
+                return self.take_layered(i, v);
+            }
+            self.film_give(i, v);
+            let vol = &mut *self.vol.add(i);
+            let got = if self.drain { take_from(&mut *self.hide.add(i), *vol, v) } else { *self.hide.add(i) };
+            *vol -= v;
+            if self.cure_now && *vol < 1e-5 && !self.dry.is_null() {
+                (*self.dry.add(i)).cure = 0.0;
+            }
+            got
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn take_layered(&self, i: usize, v: f32) -> Prop {
+        unsafe { self.take_with_lat(i, v).0 }
+    }
+
     #[inline]
     pub(crate) unsafe fn take_with_lat(&self, i: usize, v: f32) -> (Prop, Option<Latent>) {
         unsafe {
@@ -2029,7 +2057,7 @@ pub(crate) unsafe fn exchange(
                                 got_s += ts / COAT_UM * px_area;
                             }
                         }
-                        let hp = sf.take(i, take);
+                        let hp = sf.take_old(i, take);
                         for k in 0..hp.len() {
                             got_h[k] += hp[k] * tv;
                         }
@@ -2141,7 +2169,7 @@ pub(crate) unsafe fn exchange(
                                     let cj = &mut *sf.cover.add(j);
                                     *cj = if fine { ((if *sf.vol.add(j) < 1e-6 { 0.0 } else { *cj }) + (m / v.max(1e-9)).min(1.0) * *sf.cover.add(i)).min(1.0) } else { 1.0 };
                                     let picked = sf.pickup_lat(i, m).or_else(|| sf.layers.then(|| (*sf.lat.add(i)).clone()));
-                                    let hd = sf.take(i, m);
+                                    let hd = sf.take_old(i, m);
                                     // (None only without layers, where nothing in this loop
                                     // writes lat[i] and add writes lat[j], j != i: pixel i's
                                     // latent is still what it was before the plough)
