@@ -44,7 +44,8 @@ pub(crate) struct Hit {
 /// index, the clip's acceptance there (read once) and the packed sum.
 #[derive(Clone)]
 pub(crate) struct Acc {
-    pub parts: crate::wet::Latent,
+    /// The tubes' sums, each tube listed once (`exchange::gather`).
+    pub parts: Vec<(usize, f32)>,
     pub j: usize,
     pub k: f32,
     pub a: [f32; PACK],
@@ -68,6 +69,12 @@ pub struct Window {
     stamp: Vec<u64>,
     /// Cells started this contact, in the order they were first hit.
     used: Vec<u32>,
+    /// Scratch for the paint the bristle picks up: its tubes' sums, and the
+    /// paint they mix to.
+    pub(crate) got_parts: Vec<(usize, f32)>,
+    pub(crate) got_l: crate::wet::Latent,
+    /// Scratch for the paint landing in a cell.
+    land: crate::wet::Latent,
 }
 
 impl Window {
@@ -81,7 +88,7 @@ impl Window {
         self.used.clear();
         let n = interior.2.saturating_sub(interior.0) * interior.3.saturating_sub(interior.1);
         if self.cells.len() < n {
-            self.cells.resize(n, Acc { parts: Default::default(), j: 0, k: 0.0, a: [0.0; PACK] });
+            self.cells.resize(n, Acc { parts: Vec::new(), j: 0, k: 0.0, a: [0.0; PACK] });
             self.stamp.resize(n, 0);
         }
     }
@@ -97,7 +104,7 @@ impl Window {
         if self.stamp[c] != self.generation {
             self.stamp[c] = self.generation;
             let cell = &mut self.cells[c];
-            cell.parts.parts.clear();
+            cell.parts.clear();
             cell.j = j;
             cell.k = k();
             cell.a.fill(0.0);
@@ -106,9 +113,11 @@ impl Window {
         &mut self.cells[c]
     }
 
-    /// The cells hit this contact, in first-hit order.
-    pub(crate) fn hit_cells(&self) -> impl Iterator<Item = &Acc> + '_ {
-        self.used.iter().map(|&c| &self.cells[c as usize])
+    /// The cells hit this contact, in first-hit order, and the scratch
+    /// latent their paint lands through.
+    pub(crate) fn hit_cells(&mut self) -> (impl Iterator<Item = &Acc> + '_, &mut crate::wet::Latent) {
+        let cells = &self.cells;
+        (self.used.iter().map(move |&c| &cells[c as usize]), &mut self.land)
     }
 }
 
