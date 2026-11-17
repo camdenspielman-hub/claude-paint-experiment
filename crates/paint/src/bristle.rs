@@ -904,7 +904,12 @@ impl Surf {
             if !self.absorb.is_null() {
                 let scatter = hd[0];
                 *vol = if self.drain { ground_drain(&mut *self.absorb.add(i), t, hd) } else { ground_draw(&mut *self.absorb.add(i), v, t, hd) };
-                if self.volume_latent && scatter > 0.0 { l.concentrate(hd[0] / scatter); }
+                if self.volume_latent && scatter > 0.0 {
+                    // (by exactly 1, a no-op: every lane and part was just
+                    // mixed, so none is a signalling NaN, and no layers)
+                    let f = hd[0] / scatter;
+                    if f != 1.0 { l.concentrate(f); }
+                }
             }
         }
     }
