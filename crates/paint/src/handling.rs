@@ -1412,10 +1412,13 @@ fn place(hd: &Handling, f: Frame, gap: f32, mean_len: f32, wk: f32, seed: u64, r
         let j = (rng.next_u64() % (i as u64 + 1)) as usize;
         rank.swap(i, j);
     }
-    // (x, y, passage, passage rank, key within the passage)
-    let mut out: Vec<(f32, f32, usize, usize, f32)> = Vec::new();
+    // (x, y, passage, key within the passage), pushed passage by passage:
+    // passage p's centers are out[starts[p]..starts[p + 1]]
+    let mut out: Vec<(f32, f32, usize, f32)> = Vec::new();
+    let mut starts: Vec<usize> = Vec::with_capacity(nx * ny + 1);
     for pj in 0..ny {
         for pi in 0..nx {
+            starts.push(out.len());
             let (sx, sy) = (x0 + pi as f32 * side, y0 + pj as f32 * side);
             let (pcx, pcy) = (sx + 0.5 * side, sy + 0.5 * side);
             let a = (hd.angle)(pcx.clamp(0.0, f.width()), pcy.clamp(0.0, f.height()));
@@ -1449,17 +1452,35 @@ fn place(hd: &Handling, f: Frame, gap: f32, mean_len: f32, wk: f32, seed: u64, r
                             Order::Sweep(s) => x * s.cos() + y * s.sin() + rng.normal() * gap * 0.3,
                             Order::Scatter => rng.f(),
                         };
-                        out.push((x, y, pj * nx + pi, rank[pj * nx + pi], key));
+                        out.push((x, y, pj * nx + pi, key));
                     }
                 }
             }
         }
     }
+    starts.push(out.len());
+    let by_key = |a: &(f32, f32, usize, f32), b: &(f32, f32, usize, f32)| a.3.total_cmp(&b.3);
     match hd.order.unwrap_or_default() {
-        Order::Passages => out.sort_by(|a, b| a.3.cmp(&b.3).then(a.4.total_cmp(&b.4))),
-        _ => out.sort_by(|a, b| a.4.total_cmp(&b.4)),
+        // passages by rank, each in key order (stable): the order one stable
+        // sort by (rank, key) gives, as a passage's centers are contiguous
+        Order::Passages => {
+            let mut by_rank = vec![0; nx * ny];
+            for (p, &r) in rank.iter().enumerate() {
+                by_rank[r] = p;
+            }
+            let mut sorted = Vec::with_capacity(out.len());
+            for p in by_rank {
+                let s = &mut out[starts[p]..starts[p + 1]];
+                s.sort_by(by_key);
+                sorted.extend(s.iter().map(|&(x, y, p, _)| (x, y, p)));
+            }
+            sorted
+        }
+        _ => {
+            out.sort_by(by_key);
+            out.into_iter().map(|(x, y, p, _)| (x, y, p)).collect()
+        }
     }
-    out.into_iter().map(|(x, y, p, _, _)| (x, y, p)).collect()
 }
 
 /// A stroke length: uniform in the range, with a tail of short dabs and
